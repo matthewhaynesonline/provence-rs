@@ -119,45 +119,67 @@ pub fn split_sentences_and_track_from_encoding(
 fn split_and_trim_sentences(context: &str) -> SplitAndTrimResult {
     let mut sentences: Vec<String> = Vec::new();
     let mut ranges: Vec<(usize, usize)> = Vec::new();
-    let mut current_start = 0;
 
-    // TODO use something like https://crates.io/crates/punkt?
-    for (i, ch) in context.char_indices() {
-        let is_sentence_ending = config::SENTENCE_ENDING.contains(&ch);
+    #[cfg(feature = "punkt")]
+    {
+        // TODO: cache?
+        // TODO: custom train?
+        // TODO: use tokenizers?
+        let data = punkt::TrainingData::english();
 
-        if is_sentence_ending {
-            let next_i = i + ch.len_utf8();
-
-            // if next char is whitespace or we are at EOF, treat as sentence boundary
-            if next_i >= context.len()
-                || context[next_i..]
-                    .chars()
-                    .next()
-                    .map(|next_ch| next_ch.is_whitespace())
-                    .unwrap_or(false)
+        for (start, end) in
+            punkt::SentenceByteOffsetTokenizer::<punkt::params::Standard>::new(context, &data)
+        {
+            if let Some((trim_start, trim_end, sentence)) = trim_range(context, start, end)?
+                && !sentence.is_empty()
             {
-                if let Some((trim_start, trim_end, sentence)) =
-                    trim_range(context, current_start, next_i)?
-                    && !sentence.is_empty()
-                {
-                    sentences.push(sentence);
-                    ranges.push((trim_start, trim_end));
-                }
-
-                current_start = next_i;
+                sentences.push(sentence);
+                ranges.push((trim_start, trim_end));
             }
         }
     }
 
-    // Handle any leftovers
-    // Last part of the text that doesn't end with a punctuation mark
-    if current_start < context.len()
-        && let Some((trim_start, trim_end, sentence)) =
-            trim_range(context, current_start, context.len())?
-        && !sentence.is_empty()
+    #[cfg(not(feature = "punkt"))]
     {
-        sentences.push(sentence);
-        ranges.push((trim_start, trim_end));
+        let mut current_start = 0;
+
+        for (i, ch) in context.char_indices() {
+            let is_sentence_ending = config::SENTENCE_ENDING.contains(&ch);
+
+            if is_sentence_ending {
+                let next_i = i + ch.len_utf8();
+
+                // if next char is whitespace or we are at EOF, treat as sentence boundary
+                if next_i >= context.len()
+                    || context[next_i..]
+                        .chars()
+                        .next()
+                        .map(|next_ch| next_ch.is_whitespace())
+                        .unwrap_or(false)
+                {
+                    if let Some((trim_start, trim_end, sentence)) =
+                        trim_range(context, current_start, next_i)?
+                        && !sentence.is_empty()
+                    {
+                        sentences.push(sentence);
+                        ranges.push((trim_start, trim_end));
+                    }
+
+                    current_start = next_i;
+                }
+            }
+        }
+
+        // Handle any leftovers
+        // Last part of the text that doesn't end with a punctuation mark
+        if current_start < context.len()
+            && let Some((trim_start, trim_end, sentence)) =
+                trim_range(context, current_start, context.len())?
+            && !sentence.is_empty()
+        {
+            sentences.push(sentence);
+            ranges.push((trim_start, trim_end));
+        }
     }
 
     Ok((sentences, ranges))
