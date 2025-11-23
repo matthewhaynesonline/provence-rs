@@ -138,11 +138,10 @@ fn split_and_trim_sentences(context: &str) -> SplitAndTrimResult {
             {
                 if let Some((trim_start, trim_end, sentence)) =
                     trim_range(context, current_start, next_i)?
+                    && !sentence.is_empty()
                 {
-                    if !sentence.is_empty() {
-                        sentences.push(sentence);
-                        ranges.push((trim_start, trim_end));
-                    }
+                    sentences.push(sentence);
+                    ranges.push((trim_start, trim_end));
                 }
 
                 current_start = next_i;
@@ -152,15 +151,13 @@ fn split_and_trim_sentences(context: &str) -> SplitAndTrimResult {
 
     // Handle any leftovers
     // Last part of the text that doesn't end with a punctuation mark
-    if current_start < context.len() {
-        if let Some((trim_start, trim_end, sentence)) =
+    if current_start < context.len()
+        && let Some((trim_start, trim_end, sentence)) =
             trim_range(context, current_start, context.len())?
-        {
-            if !sentence.is_empty() {
-                sentences.push(sentence);
-                ranges.push((trim_start, trim_end));
-            }
-        }
+        && !sentence.is_empty()
+    {
+        sentences.push(sentence);
+        ranges.push((trim_start, trim_end));
     }
 
     Ok((sentences, ranges))

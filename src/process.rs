@@ -151,12 +151,10 @@ impl ProvenceModel {
             .filter(|c| !c.is_ascii_punctuation())
             .collect();
 
-        let normalized_white_space = lower_no_punctuation
+        lower_no_punctuation
             .split_whitespace()
             .collect::<Vec<&str>>()
-            .join(" ");
-
-        normalized_white_space
+            .join(" ")
     }
 
     pub fn get_separator_index(encoding: &Encoding) -> Option<usize> {
