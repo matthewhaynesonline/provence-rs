@@ -1,0 +1,13 @@
+[package]
+name = "candle_shims"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "candle_shims"
+path = "src/lib.rs"
+
+[dependencies]
+candle-core = { workspace = true }
+candle-transformers = { workspace = true }
