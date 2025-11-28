@@ -9,7 +9,7 @@ use hf_hub::{Repo, RepoType, api::sync::Api};
 use tokenizers::{Encoding, PaddingParams, Tokenizer};
 
 use candle_shims::utils::device::get_device;
-use provence_rs::ProvenceModel;
+use provence_rs::{ProvenceModel, sentence_rounding::SentenceRoundingMode};
 
 enum TaskType {
     Single(Box<ProvenceModel>),
@@ -23,7 +23,7 @@ enum ArgsTask {
 impl fmt::Display for ArgsTask {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            ArgsTask::Single => write!(f, "single"),
+            Self::Single => write!(f, "single"),
         }
     }
 }
@@ -74,6 +74,18 @@ struct Args {
     /// Threshold
     #[arg(short, long, default_value = "0.5")]
     threshold: f32,
+
+    /// Always select first sentence
+    #[arg(long, default_value_t = true)]
+    always_select_first: bool,
+
+    /// Include token details
+    #[arg(long)]
+    detailed_output: bool,
+
+    /// Which sentence rounding mode to use
+    #[arg(long, default_value_t = SentenceRoundingMode::DecisionAverage)]
+    rounding_mode: SentenceRoundingMode,
 
     /// Which task to run
     #[arg(long, default_value_t = ArgsTask::Single)]
@@ -145,7 +157,6 @@ fn main() -> Result<()> {
             let question = &args.question;
             let context = args.context.first().context("context can't be empty")?;
 
-            // Forward only
             println!("Running forward pass only");
 
             let input_text = ProvenceModel::format_input(question, context);
@@ -163,49 +174,61 @@ fn main() -> Result<()> {
             println!("Forward pass output");
             dbg!(&output);
 
-            // Simple usage
             println!("Running process helper function");
-            let result =
-                model.process_single(&tokenizer, question, context, args.threshold, false, true)?;
+            let result = model.process_single(
+                &tokenizer,
+                question,
+                context,
+                args.threshold,
+                args.always_select_first,
+                args.detailed_output,
+                Some(args.rounding_mode),
+            )?;
 
             println!("Simple output");
             println!("Pruned: {}", result.pruned_context);
             println!("Score: {:.2}", result.reranking_score);
             println!("Compression: {:.1}%", result.compression_rate);
 
-            // Detailed usage
-            println!("Detailed output");
-            let max_tokens = 80;
+            if args.detailed_output {
+                println!("Detailed output");
+                let max_tokens = 80;
+                let token_details = result.token_details.context("token details is none")?;
 
-            let token_details = result.token_details.context("token details is none")?;
+                println!("Ranking Score: {:.4}", result.reranking_score);
+                println!("  (Higher = more relevant context for this query)\n");
 
-            println!("Ranking Score: {:.4}", result.reranking_score);
-            println!("  (Higher = more relevant context for this query)\n");
+                println!("Original Context Length (chars): {}", context.len());
 
-            println!("Original Context Length (chars): {}", context.len());
-            println!(
-                "Pruned Context Length (chars): {}",
-                result.pruned_context.len()
-            );
-            println!(
-                "Compression Rate (context-only): {:.1}%",
-                result.compression_rate
-            );
-
-            println!("\nQuestion:\n{}", question);
-            println!("\nPruned Context:\n{}\n", result.pruned_context);
-
-            println!("Token-level Analysis (first {} tokens)", max_tokens);
-            for detail in token_details.iter().take(max_tokens) {
                 println!(
-                    "{:3}: {:20} prob={:.3} -> {}",
-                    detail.index,
-                    format!("'{}'", detail.token),
-                    detail.probability,
-                    detail.status
+                    "Pruned Context Length (chars): {}",
+                    result.pruned_context.len()
+                );
+
+                println!(
+                    "Compression Rate (context-only): {:.1}%",
+                    result.compression_rate
+                );
+
+                println!("\nQuestion:\n{}", question);
+                println!("\nPruned Context:\n{}\n", result.pruned_context);
+
+                println!("Token-level Analysis (first {} tokens)", max_tokens);
+
+                for detail in token_details.iter().take(max_tokens) {
+                    println!(
+                        "{:3}: {:20} prob={:.3} -> {}",
+                        detail.index,
+                        format!("'{}'", detail.token),
+                        detail.probability,
+                        detail.status
+                    );
+                }
+
+                println!(
+                    "\nNOTE: With sentence rounding, entire sentences are kept/dropped together"
                 );
             }
-            println!("\nNOTE: With sentence rounding, entire sentences are kept/dropped together");
         }
     }
 

@@ -5,7 +5,9 @@ use tokenizers::{Encoding, Tokenizer};
 
 use super::{
     ProvenceModel, ProvenceOutput, config,
-    sentence_rounding::{sentence_rounding, split_sentences_and_track_from_encoding},
+    sentence_rounding::{
+        SentenceRoundingMode, sentence_rounding, split_sentences_and_track_from_encoding,
+    },
 };
 
 pub type InputEncodingResult = (Encoding, Tensor, Tensor);
@@ -46,6 +48,7 @@ pub struct TokenDetail {
 
 impl ProvenceModel {
     /// Process a single query-context pair with sentence-level rounding
+    #[allow(clippy::too_many_arguments)]
     pub fn process_single(
         &self,
         tokenizer: &Tokenizer,
@@ -54,7 +57,9 @@ impl ProvenceModel {
         threshold: f32,
         always_select_first: bool,
         include_token_details: bool,
+        rounding_mode: Option<SentenceRoundingMode>,
     ) -> Result<ProcessedResult> {
+        let rounding_mode = rounding_mode.unwrap_or(SentenceRoundingMode::DecisionAverage);
         // TODO: check python implementation
         let normalize_question = true;
 
@@ -72,7 +77,6 @@ impl ProvenceModel {
         };
 
         let (encoding, input_ids, attention_mask) = self.encode_input(tokenizer, &input_text)?;
-
         let tokens = encoding.get_ids();
 
         let separator_index =
@@ -95,6 +99,7 @@ impl ProvenceModel {
             &sentences_token_coords,
             threshold,
             always_select_first,
+            rounding_mode,
         )?;
 
         let (kept_token_ids, _removed_token_ids) =
