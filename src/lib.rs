@@ -36,10 +36,6 @@ pub struct ProvenceModel {
     token_classifier: candle_nn::Linear,
 }
 
-pub mod config {
-    pub const SEPARATOR_TOKEN: &str = "[SEP]";
-}
-
 impl ProvenceModel {
     pub fn load(vb: VarBuilder, config: &Config, id2label: Option<Id2Label>) -> Result<Self> {
         let id2label_len = id2label_len(config, id2label)?;
@@ -94,9 +90,5 @@ impl ProvenceModel {
             hidden_states: None,
             attentions: None,
         })
-    }
-
-    pub fn format_input(question: &str, context: &str) -> String {
-        format!("{} {} {}", question, config::SEPARATOR_TOKEN, context)
     }
 }

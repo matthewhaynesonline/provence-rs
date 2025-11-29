@@ -1,65 +1,237 @@
-use std::fmt;
+use std::vec;
 
-use candle_core::{Context, Error, IndexOp, Result, Tensor};
+use candle_core::{Context, Error, IndexOp, Result, Tensor, bail};
+use either::Either;
 use tokenizers::{Encoding, Tokenizer};
 
 use super::{
-    ProvenceModel, ProvenceOutput, config,
+    ProvenceModel, ProvenceOutput,
     sentence_rounding::{
         SentenceRoundingMode, sentence_rounding, split_sentences_and_track_from_encoding,
     },
 };
 
-pub type InputEncodingResult = (Encoding, Tensor, Tensor);
+pub type MultipleQuestions = Vec<String>;
+pub type MultipleContext = Vec<Vec<String>>;
+pub type MultipleTitle = Vec<Vec<String>>;
+pub type PreparedProcessParams = (MultipleQuestions, MultipleContext, Option<MultipleTitle>);
+pub type EncodedInput = (Encoding, Tensor, Tensor);
+
+#[derive(Debug, Clone)]
+pub struct ProcessedResults {
+    pub pruned_context: MultipleContext,
+    pub reranking_score: Vec<Vec<f32>>,
+    pub compression_rate: Vec<Vec<f32>>,
+}
 
 #[derive(Debug, Clone)]
 pub struct ProcessedResult {
+    pub question: String,
+    pub context: String,
     pub pruned_context: String,
     pub reranking_score: f32,
     pub compression_rate: f32,
-    pub token_details: Option<Vec<TokenDetail>>,
+    // pub token_details: Option<Vec<TokenDetail>>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum TokenStatus {
-    QuestionOrSpecial,
-    Kept,
-    Dropped,
-}
+// #[derive(Debug, Clone, PartialEq)]
+// pub enum TokenStatus {
+//     QuestionOrSpecial,
+//     Kept,
+//     Dropped,
+// }
 
-impl fmt::Display for TokenStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            TokenStatus::QuestionOrSpecial => "KEEP (Q/SPECIAL)",
-            TokenStatus::Kept => "KEEP",
-            TokenStatus::Dropped => "DROP",
-        };
-        write!(f, "{}", s)
-    }
-}
+// impl fmt::Display for TokenStatus {
+//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+//         let s = match self {
+//             TokenStatus::QuestionOrSpecial => "KEEP (Q/SPECIAL)",
+//             TokenStatus::Kept => "KEEP",
+//             TokenStatus::Dropped => "DROP",
+//         };
+//         write!(f, "{}", s)
+//     }
+// }
 
-#[derive(Debug, Clone)]
-pub struct TokenDetail {
-    pub index: usize,
-    pub token: String,
-    pub probability: f32,
-    pub status: TokenStatus,
+// #[derive(Debug, Clone)]
+// pub struct TokenDetail {
+//     pub index: usize,
+//     pub token: String,
+//     pub probability: f32,
+//     pub status: TokenStatus,
+// }
+
+pub mod config {
+    // TODO: don't hardcode
+    pub const SEPARATOR_TOKEN: &str = "[SEP]";
+    pub const TITLE_PARAM_SPECIAL_VALUE: &str = "first_sentence";
 }
 
 impl ProvenceModel {
-    /// Process a single query-context pair with sentence-level rounding
+    pub fn format_input(question: &str, context: &str) -> String {
+        format!("{} {} {}", question, config::SEPARATOR_TOKEN, context)
+    }
+
+    /// Process query / context with sentence-level rounding
     #[allow(clippy::too_many_arguments)]
-    pub fn process_single(
+    pub fn process(
+        &self,
+        tokenizer: &Tokenizer,
+        // TODO: make slices?
+        question: Either<MultipleQuestions, &str>,
+        context: Either<MultipleContext, &str>,
+        title: Option<Either<MultipleTitle, &str>>,
+        threshold: Option<f32>,
+        always_select_first: Option<bool>,
+        batch_size: Option<usize>,
+        reorder: Option<bool>,
+        top_k: Option<usize>,
+        enable_warnings: Option<bool>,
+        rounding_mode: Option<SentenceRoundingMode>,
+    ) -> Result<ProcessedResults> {
+        let (queries, contexts, titles) = Self::prepare_process_params(question, context, title)?;
+
+        let threshold = threshold.unwrap_or(0.1);
+        let always_select_first = always_select_first.unwrap_or(true);
+        let batch_size = batch_size.unwrap_or(32);
+        let reorder = reorder.unwrap_or(false);
+        let top_k = top_k.unwrap_or(5);
+        let enable_warnings = enable_warnings.unwrap_or(true);
+        let rounding_mode = rounding_mode.unwrap_or(SentenceRoundingMode::DecisionAverage);
+
+        let mut pruned_context = Vec::with_capacity(queries.len());
+        let mut reranking_score = Vec::with_capacity(queries.len());
+        let mut compression_rate = Vec::with_capacity(queries.len());
+
+        for (question_i, question) in queries.iter().enumerate() {
+            let question_contexts = contexts.get(question_i).context(format!(
+                "Couldn't get contexts for index {question_i} value {question}",
+            ))?;
+
+            let mut context_buffer = Vec::with_capacity(question_contexts.len());
+            let mut reranking_buffer = Vec::with_capacity(question_contexts.len());
+            let mut compression_buffer = Vec::with_capacity(question_contexts.len());
+
+            for (context_i, context) in question_contexts.iter().enumerate() {
+                let context = match titles {
+                    Some(ref titles) => {
+                        let context_title = titles
+                            .get(question_i)
+                            .context(format!(
+                                "Couldn't get outer titles vec at index {question_i}"
+                            ))?
+                            .get(context_i)
+                            .context(format!(
+                                "Couldn't get inner title value at index {context_i}"
+                            ))?;
+
+                        format!("{context_title} {context}")
+                    }
+                    None => context.to_owned(),
+                };
+
+                // TODO: tokenizer questions / sep / context separately, cache, then combine for forward?
+                let result = self.process_question_context(
+                    tokenizer,
+                    question,
+                    context.as_str(),
+                    threshold,
+                    always_select_first,
+                    rounding_mode.clone(),
+                )?;
+
+                context_buffer.push(result.pruned_context);
+                reranking_buffer.push(result.reranking_score);
+                compression_buffer.push(result.compression_rate);
+            }
+
+            if reorder {
+                let mut idxs: Vec<usize> = (0..reranking_buffer.len()).collect();
+
+                idxs.sort_by(|&a, &b| {
+                    reranking_buffer[b]
+                        .partial_cmp(&reranking_buffer[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                let idxs: Vec<usize> = idxs.into_iter().take(top_k).collect();
+
+                context_buffer = idxs.iter().map(|&j| context_buffer[j].clone()).collect();
+                reranking_buffer = idxs.iter().map(|&j| reranking_buffer[j]).collect();
+                compression_buffer = idxs.iter().map(|&j| compression_buffer[j]).collect();
+            }
+
+            pruned_context.push(context_buffer);
+            reranking_score.push(reranking_buffer);
+            compression_rate.push(compression_buffer);
+        }
+
+        Ok(ProcessedResults {
+            pruned_context,
+            reranking_score,
+            compression_rate,
+        })
+    }
+
+    pub fn prepare_process_params(
+        question: Either<MultipleQuestions, &str>,
+        context: Either<MultipleContext, &str>,
+        title: Option<Either<MultipleTitle, &str>>,
+    ) -> Result<PreparedProcessParams> {
+        // Convert input format into questions of Vec[str] and contexts/titles of Vec[Vec[str]]
+        let queries = match question {
+            Either::Left(q) => q,
+            Either::Right(q) => vec![q.to_owned()],
+        };
+
+        let contexts = match context {
+            Either::Left(c) => c
+                .into_iter()
+                .map(|inner| inner.into_iter().collect())
+                .collect(),
+            Either::Right(c) => vec![vec![c.to_owned()]],
+        };
+
+        let titles = match title {
+            Some(Either::Left(t)) => Some(
+                t.iter()
+                    .map(|inner| inner.iter().map(|s| s.to_string()).collect())
+                    .collect(),
+            ),
+            Some(Either::Right(config::TITLE_PARAM_SPECIAL_VALUE)) => None,
+            Some(Either::Right(s)) => Some(vec![vec![s.to_owned()]]),
+            None => None,
+        };
+
+        if let Some(ref titles) = titles {
+            if titles.len() != queries.len() {
+                bail!("'titles' must be a list of strings of the same length as 'queries'")
+            }
+
+            for (titles_item, contexts_item) in titles.iter().zip(contexts.iter()) {
+                if titles_item.len() != contexts_item.len() {
+                    bail!(
+                        "Each list in 'titles' must have the same length as the corresponding list in 'context'"
+                    )
+                }
+            }
+        }
+
+        if queries.len() != contexts.len() {
+            bail!("'queries' and 'contexts' must have same lengths")
+        }
+
+        Ok((queries, contexts, titles))
+    }
+
+    pub fn process_question_context(
         &self,
         tokenizer: &Tokenizer,
         question: &str,
         context: &str,
         threshold: f32,
         always_select_first: bool,
-        include_token_details: bool,
-        rounding_mode: Option<SentenceRoundingMode>,
+        rounding_mode: SentenceRoundingMode,
     ) -> Result<ProcessedResult> {
-        let rounding_mode = rounding_mode.unwrap_or(SentenceRoundingMode::DecisionAverage);
         // TODO: check python implementation
         let normalize_question = true;
 
@@ -111,32 +283,30 @@ impl ProvenceModel {
 
         let compression_rate = Self::calculate_compression_rate(context, &pruned_context);
 
-        let token_details = if include_token_details {
-            let token_details = Self::build_token_details(
-                encoding.get_tokens(),
-                separator_index,
-                &keep_mask,
-                &keep_probs,
-            );
+        // let token_details = if include_token_details {
+        //     let token_details = Self::build_token_details(
+        //         encoding.get_tokens(),
+        //         separator_index,
+        //         &keep_mask,
+        //         &keep_probs,
+        //     );
 
-            Some(token_details)
-        } else {
-            None
-        };
+        //     Some(token_details)
+        // } else {
+        //     None
+        // };
 
         Ok(ProcessedResult {
+            question: question.to_owned(),
+            context: context.to_owned(),
             pruned_context,
             reranking_score,
             compression_rate,
-            token_details,
+            // token_details,
         })
     }
 
-    pub fn encode_input(
-        &self,
-        tokenizer: &Tokenizer,
-        input_text: &str,
-    ) -> Result<InputEncodingResult> {
+    pub fn encode_input(&self, tokenizer: &Tokenizer, input_text: &str) -> Result<EncodedInput> {
         let encoding = tokenizer
             .encode(input_text, true)
             .map_err(|e| Error::msg(format!("Tokenization failed: {}", e)))?;
@@ -206,33 +376,33 @@ impl ProvenceModel {
         }
     }
 
-    pub fn build_token_details(
-        token_strings: &[String],
-        separator_index: usize,
-        keep_mask: &[bool],
-        keep_probs: &[f32],
-    ) -> Vec<TokenDetail> {
-        let mut token_details = Vec::with_capacity(token_strings.len());
+    // pub fn build_token_details(
+    //     token_strings: &[String],
+    //     separator_index: usize,
+    //     keep_mask: &[bool],
+    //     keep_probs: &[f32],
+    // ) -> Vec<TokenDetail> {
+    //     let mut token_details = Vec::with_capacity(token_strings.len());
 
-        for (i, token_string) in token_strings.iter().enumerate() {
-            let prob = keep_probs[i];
+    //     for (i, token_string) in token_strings.iter().enumerate() {
+    //         let prob = keep_probs[i];
 
-            let status = if i <= separator_index {
-                TokenStatus::QuestionOrSpecial
-            } else if keep_mask.get(i).copied().unwrap_or(false) {
-                TokenStatus::Kept
-            } else {
-                TokenStatus::Dropped
-            };
+    //         let status = if i <= separator_index {
+    //             TokenStatus::QuestionOrSpecial
+    //         } else if keep_mask.get(i).copied().unwrap_or(false) {
+    //             TokenStatus::Kept
+    //         } else {
+    //             TokenStatus::Dropped
+    //         };
 
-            token_details.push(TokenDetail {
-                index: i,
-                token: token_string.clone(),
-                probability: prob,
-                status,
-            });
-        }
+    //         token_details.push(TokenDetail {
+    //             index: i,
+    //             token: token_string.clone(),
+    //             probability: prob,
+    //             status,
+    //         });
+    //     }
 
-        token_details
-    }
+    //     token_details
+    // }
 }

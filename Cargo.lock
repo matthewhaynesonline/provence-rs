@@ -2034,6 +2034,7 @@ dependencies = [
  "candle-transformers",
  "candle_shims",
  "clap",
+ "either",
  "hf-hub",
  "punkt",
  "serde",

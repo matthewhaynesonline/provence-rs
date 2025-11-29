@@ -5,6 +5,7 @@ use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::debertav2::Config as DebertaV2Config;
 use clap::{Parser, ValueEnum};
+use either::Either;
 use hf_hub::{Repo, RepoType, api::sync::Api};
 use tokenizers::{Encoding, PaddingParams, Tokenizer};
 
@@ -66,10 +67,12 @@ struct Args {
         long,
         num_args = 1..,
         default_values = &[
-            "Shepherd’s pie. History. In early cookery books, the dish was a means of using leftover roasted meat of any kind, and the pie dish was lined on the sides and bottom with mashed potato, as well as having a mashed potato crust on top. Variations and similar dishes. Other potato-topped pies include: The modern ”Cumberland pie” is a version with either beef or lamb and a layer of bread- crumbs and cheese on top. In medieval times, and modern-day Cumbria, the pastry crust had a filling of meat with fruits and spices.. In Quebec, a varia- tion on the cottage pie is called ”Paˆte ́ chinois”. It is made with ground beef on the bottom layer, canned corn in the middle, and mashed potato on top.. The ”shepherdess pie” is a vegetarian version made without meat, or a vegan version made without meat and dairy.. In the Netherlands, a very similar dish called ”philosopher’s stew” () often adds ingredients like beans, apples, prunes, or apple sauce.. In Brazil, a dish called in refers to the fact that a manioc puree hides a layer of sun-dried meat.",
+            "A cottage pie is a type of meat pie made with minced or ground beef and topped with mashed potato. The dish is also known as shepherd's pie when made with lamb.",
+            "Shepherd's pie is traditionally made with lamb, while cottage pie uses beef. Both are topped with mashed potatoes and baked until golden.",
+            "Shepherd's pie. History. In early cookery books, the dish was a means of using leftover roasted meat of any kind, and the pie dish was lined on the sides and bottom with mashed potato, as well as having a mashed potato crust on top. Variations and similar dishes. Other potato-topped pies include: The modern \"Cumberland pie\" is a version with either beef or lamb and a layer of bread- crumbs and cheese on top. In medieval times, and modern-day Cumbria, the pastry crust had a filling of meat with fruits and spices.. In Quebec, a varia- tion on the cottage pie is called \"Paˆte ́ chinois\". It is made with ground beef on the bottom layer, canned corn in the middle, and mashed potato on top.. The \"shepherdess pie\" is a vegetarian version made without meat, or a vegan version made without meat and dairy.. In the Netherlands, a very similar dish called \"philosopher's stew\" () often adds ingredients like beans, apples, prunes, or apple sauce.. In Brazil, a dish called in refers to the fact that a manioc puree hides a layer of sun-dried meat.",
         ]
     )]
-    context: Vec<String>,
+    contexts: Vec<String>,
 
     /// Threshold
     #[arg(short, long, default_value = "0.5")]
@@ -79,10 +82,6 @@ struct Args {
     #[arg(long, default_value_t = true)]
     always_select_first: bool,
 
-    /// Include token details
-    #[arg(long)]
-    detailed_output: bool,
-
     /// Which sentence rounding mode to use
     #[arg(long, default_value_t = SentenceRoundingMode::DecisionAverage)]
     rounding_mode: SentenceRoundingMode,
@@ -90,6 +89,9 @@ struct Args {
     /// Which task to run
     #[arg(long, default_value_t = ArgsTask::Single)]
     task: ArgsTask,
+    // /// Include token details
+    // #[arg(long)]
+    // detailed_output: bool,
 }
 
 impl Args {
@@ -155,11 +157,11 @@ fn main() -> Result<()> {
     match task_type {
         TaskType::Single(model) => {
             let question = &args.question;
-            let context = args.context.first().context("context can't be empty")?;
+            let first_context = args.contexts.first().context("context can't be empty")?;
 
-            println!("Running forward pass only");
+            println!("Running forward pass only on question and first context");
 
-            let input_text = ProvenceModel::format_input(question, context);
+            let input_text = ProvenceModel::format_input(question, first_context);
 
             let encoding = tokenizer
                 .encode(input_text, true)
@@ -175,60 +177,65 @@ fn main() -> Result<()> {
             dbg!(&output);
 
             println!("Running process helper function");
-            let result = model.process_single(
+            let result = model.process(
                 &tokenizer,
-                question,
-                context,
-                args.threshold,
-                args.always_select_first,
-                args.detailed_output,
+                Either::Right(question),
+                Either::Left(vec![args.contexts]),
+                None,
+                Some(args.threshold),
+                Some(args.always_select_first),
+                None,
+                Some(true),
+                None,
+                None,
                 Some(args.rounding_mode),
             )?;
 
             println!("Simple output");
-            println!("Pruned: {}", result.pruned_context);
-            println!("Score: {:.2}", result.reranking_score);
-            println!("Compression: {:.1}%", result.compression_rate);
+            dbg!(&result);
+            // println!("Pruned: {}", result.pruned_context);
+            // println!("Score: {:.2}", result.reranking_score);
+            // println!("Compression: {:.1}%", result.compression_rate);
 
-            if args.detailed_output {
-                println!("Detailed output");
-                let max_tokens = 80;
-                let token_details = result.token_details.context("token details is none")?;
+            // if args.detailed_output {
+            //     println!("Detailed output");
+            //     let max_tokens = 80;
+            //     let token_details = result.token_details.context("token details is none")?;
 
-                println!("Ranking Score: {:.4}", result.reranking_score);
-                println!("  (Higher = more relevant context for this query)\n");
+            //     println!("Ranking Score: {:.4}", result.reranking_score);
+            //     println!("  (Higher = more relevant context for this query)\n");
 
-                println!("Original Context Length (chars): {}", context.len());
+            //     println!("Original Context Length (chars): {}", context.len());
 
-                println!(
-                    "Pruned Context Length (chars): {}",
-                    result.pruned_context.len()
-                );
+            //     println!(
+            //         "Pruned Context Length (chars): {}",
+            //         result.pruned_context.len()
+            //     );
 
-                println!(
-                    "Compression Rate (context-only): {:.1}%",
-                    result.compression_rate
-                );
+            //     println!(
+            //         "Compression Rate (context-only): {:.1}%",
+            //         result.compression_rate
+            //     );
 
-                println!("\nQuestion:\n{}", question);
-                println!("\nPruned Context:\n{}\n", result.pruned_context);
+            //     println!("\nQuestion:\n{}", question);
+            //     println!("\nPruned Context:\n{}\n", result.pruned_context);
 
-                println!("Token-level Analysis (first {} tokens)", max_tokens);
+            //     println!("Token-level Analysis (first {} tokens)", max_tokens);
 
-                for detail in token_details.iter().take(max_tokens) {
-                    println!(
-                        "{:3}: {:20} prob={:.3} -> {}",
-                        detail.index,
-                        format!("'{}'", detail.token),
-                        detail.probability,
-                        detail.status
-                    );
-                }
+            //     for detail in token_details.iter().take(max_tokens) {
+            //         println!(
+            //             "{:3}: {:20} prob={:.3} -> {}",
+            //             detail.index,
+            //             format!("'{}'", detail.token),
+            //             detail.probability,
+            //             detail.status
+            //         );
+            //     }
 
-                println!(
-                    "\nNOTE: With sentence rounding, entire sentences are kept/dropped together"
-                );
-            }
+            //     println!(
+            //         "\nNOTE: With sentence rounding, entire sentences are kept/dropped together"
+            //     );
+            // }
         }
     }
 
