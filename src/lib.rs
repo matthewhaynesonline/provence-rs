@@ -7,6 +7,9 @@ use candle_transformers::models::debertav2::{
 
 use candle_shims::candle_transformers::models::debertav2::id2label_len;
 
+// Re export
+pub use candle_transformers::models::debertav2::DTYPE;
+
 #[cfg(feature = "provence-process")]
 pub mod sentence_rounding;
 

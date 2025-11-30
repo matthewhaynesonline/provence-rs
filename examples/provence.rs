@@ -116,6 +116,7 @@ impl Args {
 
         tokenizer.with_padding(Some(PaddingParams::default()));
 
+        #[allow(unsafe_code)]
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(
                 &[weights_filename],
@@ -192,50 +193,8 @@ fn main() -> Result<()> {
             )?;
 
             println!("Simple output");
+            dbg!(&question);
             dbg!(&result);
-            // println!("Pruned: {}", result.pruned_context);
-            // println!("Score: {:.2}", result.reranking_score);
-            // println!("Compression: {:.1}%", result.compression_rate);
-
-            // if args.detailed_output {
-            //     println!("Detailed output");
-            //     let max_tokens = 80;
-            //     let token_details = result.token_details.context("token details is none")?;
-
-            //     println!("Ranking Score: {:.4}", result.reranking_score);
-            //     println!("  (Higher = more relevant context for this query)\n");
-
-            //     println!("Original Context Length (chars): {}", context.len());
-
-            //     println!(
-            //         "Pruned Context Length (chars): {}",
-            //         result.pruned_context.len()
-            //     );
-
-            //     println!(
-            //         "Compression Rate (context-only): {:.1}%",
-            //         result.compression_rate
-            //     );
-
-            //     println!("\nQuestion:\n{}", question);
-            //     println!("\nPruned Context:\n{}\n", result.pruned_context);
-
-            //     println!("Token-level Analysis (first {} tokens)", max_tokens);
-
-            //     for detail in token_details.iter().take(max_tokens) {
-            //         println!(
-            //             "{:3}: {:20} prob={:.3} -> {}",
-            //             detail.index,
-            //             format!("'{}'", detail.token),
-            //             detail.probability,
-            //             detail.status
-            //         );
-            //     }
-
-            //     println!(
-            //         "\nNOTE: With sentence rounding, entire sentences are kept/dropped together"
-            //     );
-            // }
         }
     }
 

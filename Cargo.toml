@@ -28,6 +28,25 @@ tokenizers = "0.21.0"
 # Local deps
 candle_shims = { path = "candle_shims" }
 
+[workspace.lints]
+rust.unsafe_code = "deny"
+# rust.warnings = "deny"
+# rust.missing_docs = "deny"
+# rust.missing_debug_implementations = "deny"
+
+clippy.unwrap_used = "deny"
+clippy.expect_used = "deny"
+clippy.panic = "deny"
+clippy.todo = "deny"
+# clippy.dbg_macro = "deny"
+clippy.unimplemented = "deny"
+clippy.indexing_slicing = "deny"
+clippy.unwrap_or_default = "deny"
+
+# optional stricter groups
+# clippy.pedantic = "deny"
+# clippy.nursery = "deny"
+
 [dependencies]
 # accelerate-src = { workspace = true, optional = true }
 candle-core = { workspace = true }
@@ -45,6 +64,9 @@ anyhow = "1.0"
 clap = { version = "4.5.53", features = ["derive"] }
 serde = { version = "1.0.171", features = ["derive"] }
 serde_json = "1.0.99"
+
+[lints]
+workspace = true
 
 [features]
 default = ["provence-process", "punkt"]
