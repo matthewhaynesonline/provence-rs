@@ -393,5 +393,8 @@ fn map_ranges_to_token_coords(
 // B doesn't end before A starts, AND
 // B doesn't start after A ends.
 fn overlaps(a: (usize, usize), b: (usize, usize)) -> bool {
-    b.1 > a.0 && b.0 < a.1
+    let (a_start, a_end) = a;
+    let (b_start, b_end) = b;
+
+    b_end > a_start && b_start < a_end
 }
