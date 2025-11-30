@@ -70,6 +70,12 @@ struct Args {
             "A cottage pie is a type of meat pie made with minced or ground beef and topped with mashed potato. The dish is also known as shepherd's pie when made with lamb.",
             "Shepherd's pie is traditionally made with lamb, while cottage pie uses beef. Both are topped with mashed potatoes and baked until golden.",
             "Shepherd's pie. History. In early cookery books, the dish was a means of using leftover roasted meat of any kind, and the pie dish was lined on the sides and bottom with mashed potato, as well as having a mashed potato crust on top. Variations and similar dishes. Other potato-topped pies include: The modern \"Cumberland pie\" is a version with either beef or lamb and a layer of bread- crumbs and cheese on top. In medieval times, and modern-day Cumbria, the pastry crust had a filling of meat with fruits and spices.. In Quebec, a varia- tion on the cottage pie is called \"Paˆte ́ chinois\". It is made with ground beef on the bottom layer, canned corn in the middle, and mashed potato on top.. The \"shepherdess pie\" is a vegetarian version made without meat, or a vegan version made without meat and dairy.. In the Netherlands, a very similar dish called \"philosopher's stew\" () often adds ingredients like beans, apples, prunes, or apple sauce.. In Brazil, a dish called in refers to the fact that a manioc puree hides a layer of sun-dried meat.",
+            "Traditional shepherd's pie often includes diced onions, carrots, and peas mixed into the minced lamb on the bottom layer, enhancing flavor and texture before the mashed potato topping is added.",
+            "Modern variations of Shepherd's pie may use sweet potato instead of mashed potato for the topping, giving a slightly sweeter taste and different nutritional profile.",
+            "Vegetarian or vegan shepherd's pies replace the meat with lentils, mushrooms, or textured vegetable protein, while keeping the layered structure of a bottom filling, vegetables, and mashed potato on top.",
+            "In the UK, Shepherd's pie is considered comfort food and is often served with a side of peas or a simple green salad, especially during colder months.",
+            "Shepherd's pie can also include a layer of gravy or sauce on the bottom to keep the filling moist, which helps prevent the mashed potato from drying out during baking.",
+            "Cultural variations: In Ireland, shepherd's pie may incorporate Irish stout into the meat mixture for deeper flavor; in Canada, 'Pâté chinois' is a common dish in Quebec, with corn as the middle layer."
         ]
     )]
     contexts: Vec<String>,
@@ -96,7 +102,7 @@ struct Args {
 
 impl Args {
     fn build_model_and_tokenizer(&self) -> Result<(TaskType, DebertaV2Config, Tokenizer)> {
-        let device = get_device(self.cpu, true)?;
+        let device = get_device(self.cpu, false)?;
 
         // Get files from either the HuggingFace API, or from a specified local directory.
         let (config_filename, tokenizer_filename, weights_filename) =
@@ -178,6 +184,9 @@ fn main() -> Result<()> {
             dbg!(&output);
 
             println!("Running process helper function");
+
+            let start = std::time::Instant::now();
+
             let result = model.process(
                 &tokenizer,
                 Either::Right(question),
@@ -192,9 +201,13 @@ fn main() -> Result<()> {
                 Some(args.rounding_mode),
             )?;
 
+            let duration = start.elapsed();
+
             println!("Simple output");
             dbg!(&question);
             dbg!(&result);
+
+            println!("Time elapsed: {:?}", duration);
         }
     }
 

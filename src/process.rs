@@ -94,6 +94,8 @@ impl ProvenceModel {
         reorder: bool,
         top_k: usize,
     ) -> Result<ProcessedResults> {
+        let start = std::time::Instant::now();
+
         if questions.is_empty() {
             return Ok(ProcessedResults {
                 pruned_context: Vec::new(),
@@ -118,6 +120,11 @@ impl ProvenceModel {
             });
         }
 
+        println!(
+            "get_questions_contexts_pairs time elapsed: {:?}",
+            start.elapsed()
+        );
+
         let mut pruned_context_by_question = vec![Vec::new(); questions.len()];
         let mut reranking_by_question = vec![Vec::new(); questions.len()];
         let mut compression_by_question = vec![Vec::new(); questions.len()];
@@ -126,6 +133,8 @@ impl ProvenceModel {
         let encodings = tokenizer
             .encode_batch(pair_input_texts, true)
             .map_err(|e| Error::msg(format!("encode_batch failed: {}", e)))?;
+
+        println!("encode_batch time elapsed: {:?}", start.elapsed());
 
         let total_pair_count = encodings.len();
         let pad_id = tokenizer.get_padding().map(|p| p.pad_id).unwrap_or(0);
@@ -141,9 +150,28 @@ impl ProvenceModel {
             let (input_ids, attention_mask, sequence_lens) =
                 Self::batch_from_encodings(encoding_chunk, pad_id, &self.device)?;
 
+            println!(
+                "while batch_from_encodings pair_cursor {} elapsed: {:?}",
+                pair_cursor,
+                start.elapsed()
+            );
+
             let output = self.forward(&input_ids, Some(attention_mask))?;
+
+            println!(
+                "while output pair_cursor {} elapsed: {:?}",
+                pair_cursor,
+                start.elapsed()
+            );
+
             let keep_probs_all = Self::calculate_keep_probs(&output.compression_logits)?;
             let ranking_scores = &output.ranking_scores;
+
+            println!(
+                "while calculate_keep_probs pair_cursor {} elapsed: {:?}",
+                pair_cursor,
+                start.elapsed()
+            );
 
             for chunk_local_index in 0..encoding_chunk.len() {
                 let pair_global_index = pair_cursor + chunk_local_index;
@@ -152,12 +180,26 @@ impl ProvenceModel {
                     .get(chunk_local_index)
                     .context("Failed to get sequence_len for sample")?;
 
+                println!(
+                    "for while sample_sequence_len chunk_local_index {} pair_cursor {} elapsed: {:?}",
+                    chunk_local_index,
+                    pair_cursor,
+                    start.elapsed()
+                );
+
                 let sample_keep_probs: Vec<f32> = keep_probs_all
                     .i(chunk_local_index)?
                     .to_vec1()?
                     .into_iter()
                     .take(sample_sequence_len)
                     .collect();
+
+                println!(
+                    "for while sample_keep_probs chunk_local_index {} pair_cursor {} elapsed: {:?}",
+                    chunk_local_index,
+                    pair_cursor,
+                    start.elapsed()
+                );
 
                 let sample_reranking_score = ranking_scores.i(chunk_local_index)?.to_vec0()?;
 
@@ -168,6 +210,13 @@ impl ProvenceModel {
                 let encoding_tokens = sample_encoding.get_ids();
                 let separator_token_index = Self::get_separator_index(sample_encoding)
                     .context("separator token missing")?;
+
+                println!(
+                    "for while get_separator_index chunk_local_index {} pair_cursor {} elapsed: {:?}",
+                    chunk_local_index,
+                    pair_cursor,
+                    start.elapsed()
+                );
 
                 let context_start_offset = pair_context_start_offsets
                     .get(pair_global_index)
@@ -236,6 +285,8 @@ impl ProvenceModel {
             pair_cursor = chunk_end;
         }
 
+        println!("post while time elapsed: {:?}", start.elapsed());
+
         // optional reorder
         if reorder {
             for question_i in 0..questions.len() {
@@ -283,6 +334,8 @@ impl ProvenceModel {
                 *compression_rates_for_question = top_compression_rates;
             }
         }
+
+        println!("post reorder elapsed: {:?}", start.elapsed());
 
         Ok(ProcessedResults {
             pruned_context: pruned_context_by_question,
