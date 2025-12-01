@@ -1,4 +1,4 @@
-use candle_core::{Context, Result, bail};
+use candle_core::{Context, DType, Result, Tensor, bail};
 use tokenizers::Encoding;
 
 pub type SplitAndTrimResult = Result<(Vec<String>, Vec<(usize, usize)>)>;
@@ -156,6 +156,118 @@ pub fn sentence_rounding(
     }
 
     Ok(keep_mask)
+}
+
+#[allow(clippy::indexing_slicing)]
+pub fn sentence_rounding_tensor(
+    token_predictions: &Tensor,
+    sentences_token_coords: &[Coordinate],
+    threshold: f32,
+    always_select_first: bool,
+    rounding_mode: &SentenceRoundingMode,
+) -> Result<Tensor> {
+    if sentences_token_coords.is_empty() {
+        bail!("sentences_token_coords is empty");
+    }
+
+    let device = token_predictions.device();
+
+    let &n_tokens = token_predictions
+        .dims()
+        .first()
+        .context("Couldn't get n_tokens")?;
+
+    let num_sentences = sentences_token_coords.len();
+
+    for coord in sentences_token_coords {
+        if coord.start >= coord.end || coord.end > n_tokens {
+            bail!(
+                "invalid Coordinate: start={}, end={}, n_tokens={}",
+                coord.start,
+                coord.end,
+                n_tokens
+            );
+        }
+    }
+
+    // Step 1: Compute all sentence means
+    let mut sentence_mean_tensors = Vec::with_capacity(num_sentences);
+
+    for coord in sentences_token_coords {
+        let sentence_tokens = token_predictions.narrow(0, coord.start, coord.end - coord.start)?;
+
+        let mean_tensor = match rounding_mode {
+            SentenceRoundingMode::ProbabilityAverage => sentence_tokens.mean_all()?,
+            SentenceRoundingMode::DecisionAverage => {
+                let decisions = sentence_tokens.ge(threshold as f64)?.to_dtype(DType::F32)?;
+                decisions.mean_all()?
+            }
+        };
+
+        sentence_mean_tensors.push(mean_tensor);
+    }
+
+    // Step 2: Stack means and compare to threshold
+    let means_stacked = Tensor::stack(&sentence_mean_tensors, 0)?; // [num_sentences]
+    let mut keeps_tensor = means_stacked.gt(threshold as f64)?; // [num_sentences] of u8 0/1
+
+    // Step 3: Handle always_select_first
+    if always_select_first && num_sentences > 1 {
+        // Check if ANY sentence after first exceeds threshold
+        let rest_keeps = keeps_tensor.narrow(0, 1, num_sentences - 1)?;
+        let any_rest = rest_keeps.max_all()?;
+
+        let first_keep = keeps_tensor.narrow(0, 0, 1)?; // [1]
+
+        // OR operation: max(first_keep, any_rest)
+        let new_first = first_keep.broadcast_maximum(&any_rest.reshape((1,))?)?;
+
+        // Concatenate back
+        keeps_tensor = Tensor::cat(&[new_first, rest_keeps], 0)?;
+    }
+
+    // Step 4: Build coordinates
+    let starts: Vec<u32> = sentences_token_coords
+        .iter()
+        .map(|c| c.start as u32)
+        .collect();
+
+    let ends: Vec<u32> = sentences_token_coords
+        .iter()
+        .map(|c| c.end as u32)
+        .collect();
+
+    // Transfer coordinates to GPU
+    let starts_tensor = Tensor::from_vec(starts, num_sentences, device)?;
+    let ends_tensor = Tensor::from_vec(ends, num_sentences, device)?;
+
+    // Step 5: Build token indices
+    let token_indices = Tensor::arange(0u32, n_tokens as u32, device)?; // [n_tokens]
+
+    // Step 6: Reshape for broadcasting
+    let tokens_2d = token_indices.unsqueeze(1)?; // [n_tokens, 1]
+    let starts_2d = starts_tensor.unsqueeze(0)?; // [1, num_sentences]
+    let ends_2d = ends_tensor.unsqueeze(0)?; // [1, num_sentences]
+    let keeps_2d = keeps_tensor.unsqueeze(0)?; // [1, num_sentences]
+
+    // Step 7: Broadcast comparisons - creates [n_tokens, num_sentences] matrices
+    // Each element [i,j] = 1 if token i is in sentence j's range and sentence j is kept
+    let ge_start = tokens_2d.broadcast_ge(&starts_2d)?; // [n_tokens, num_sentences]
+    let lt_end = tokens_2d.broadcast_lt(&ends_2d)?; // [n_tokens, num_sentences]
+
+    // AND: in_range[i,j] = (token i >= start_j) AND (token i < end_j)
+    let in_range = ge_start
+        .to_dtype(DType::U8)?
+        .mul(&lt_end.to_dtype(DType::U8)?)?; // [n_tokens, num_sentences]
+
+    // AND with keep decisions: mask[i,j] = in_range[i,j] AND keep[j]
+    let keeps_broadcasted = keeps_2d.broadcast_as((n_tokens, num_sentences))?;
+    let masks = in_range.mul(&keeps_broadcasted.to_dtype(DType::U8)?)?; // [n_tokens, num_sentences]
+
+    // Step 8: OR across all sentences - if ANY sentence keeps token i, keep it
+    let final_mask = masks.max(1)?; // [n_tokens] - max across sentence dimension
+
+    Ok(final_mask)
 }
 
 /// Split context into sentences (simple splitter) but return token index coords
