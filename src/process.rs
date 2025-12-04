@@ -35,6 +35,10 @@ pub mod config {
     // TODO: don't hardcode
     pub const SEPARATOR_TOKEN: &str = "[SEP]";
     pub const TITLE_PARAM_SPECIAL_VALUE: &str = "first_sentence";
+    pub const MAX_LEN: usize = 512;
+    // TODO: use tokens not chars
+    pub const CHARS_PER_TOKEN: usize = 4;
+    pub const MAX_LEN_CHARS: usize = MAX_LEN * CHARS_PER_TOKEN;
 }
 
 impl ProvenceModel {
@@ -263,17 +267,17 @@ impl ProvenceModel {
         context: Either<MultipleContexts, &str>,
         title: Option<Either<MultipleTitles, &str>>,
     ) -> Result<PreparedProcessParams> {
-        let questions = match question {
+        let mut questions = match question {
             Either::Left(q) => q,
             Either::Right(q) => vec![q.to_owned()],
         };
 
-        let contexts = match context {
+        let mut contexts = match context {
             Either::Left(c) => c,
             Either::Right(c) => vec![vec![c.to_owned()]],
         };
 
-        let titles = title.and_then(|t| match t {
+        let mut titles = title.and_then(|t| match t {
             Either::Left(t) => Some(t),
             Either::Right(s) => {
                 if s == config::TITLE_PARAM_SPECIAL_VALUE {
@@ -284,25 +288,159 @@ impl ProvenceModel {
             }
         });
 
-        if let Some(ref titles) = titles {
-            if titles.len() != questions.len() {
-                bail!("'titles' must be a list of strings of the same length as 'questions'")
-            }
-
-            for (titles_item, contexts_item) in titles.iter().zip(contexts.iter()) {
-                if titles_item.len() != contexts_item.len() {
-                    bail!(
-                        "Each list in 'titles' must have the same length as the corresponding list in 'context'"
-                    )
-                }
-            }
-        }
-
         if questions.len() != contexts.len() {
             bail!("'questions' and 'contexts' must have same lengths")
         }
 
+        for (question_i, question) in questions.iter_mut().enumerate() {
+            if question.is_empty() {
+                bail!("Question '{}' cannot be empty", question_i)
+            }
+
+            Self::truncate_warn(question, &format!("Question {}", question_i));
+        }
+
+        match titles {
+            Some(ref mut titles) => {
+                for (inner_contexts_index, (inner_contexts, inner_titles)) in
+                    contexts.iter_mut().zip(titles.iter_mut()).enumerate()
+                {
+                    let mut new_inner_contexts = Vec::with_capacity(inner_contexts.len());
+                    let mut new_inner_titles = Vec::with_capacity(inner_titles.len());
+
+                    if inner_contexts.len() != inner_titles.len() {
+                        bail!(
+                            "Context list {} has length {} but title list has length {}",
+                            inner_contexts_index,
+                            inner_contexts.len(),
+                            inner_titles.len()
+                        );
+                    }
+
+                    for (context_index, (mut context, title)) in inner_contexts
+                        .drain(..)
+                        .zip(inner_titles.drain(..))
+                        .enumerate()
+                    {
+                        let split_result = Self::split_warn(
+                            &mut context,
+                            &format!("Context [{}][{}]", inner_contexts_index, context_index),
+                        );
+
+                        new_inner_contexts.push(context);
+                        new_inner_titles.push(title.clone());
+
+                        if let Some(splits) = split_result {
+                            for split_chunk in splits {
+                                new_inner_contexts.push(split_chunk);
+                                new_inner_titles.push(title.clone());
+                            }
+                        }
+                    }
+
+                    *inner_contexts = new_inner_contexts;
+                    *inner_titles = new_inner_titles;
+                }
+            }
+            None => {
+                for (inner_contexts_index, inner_contexts) in contexts.iter_mut().enumerate() {
+                    let mut new_inner_contexts = Vec::with_capacity(inner_contexts.len());
+
+                    for (context_index, mut context_str) in inner_contexts.drain(..).enumerate() {
+                        let split_result = Self::split_warn(
+                            &mut context_str,
+                            &format!("Context [{}][{}]", inner_contexts_index, context_index),
+                        );
+
+                        new_inner_contexts.push(context_str);
+
+                        if let Some(splits) = split_result {
+                            new_inner_contexts.extend(splits);
+                        }
+                    }
+                    *inner_contexts = new_inner_contexts;
+                }
+            }
+        }
+
+        if let Some(ref mut titles) = titles {
+            if titles.len() != questions.len() {
+                bail!("'titles' must be a list of strings of the same length as 'questions'")
+            }
+
+            for (inner_titles, inner_contexts) in titles.iter_mut().zip(contexts.iter()) {
+                let inner_titles_len = inner_titles.len();
+                let inner_contexts_len = inner_contexts.len();
+
+                if inner_titles_len != inner_contexts_len {
+                    bail!(
+                        "Each list in 'titles' must have the same length as the corresponding list in 'context'"
+                    )
+                }
+
+                for (title_i, title) in inner_titles.iter_mut().enumerate() {
+                    Self::truncate_warn(title, &format!("Title {}", title_i));
+                }
+            }
+        }
+
         Ok((questions, contexts, titles))
+    }
+
+    fn split_warn(text: &mut String, label: &str) -> Option<Vec<String>> {
+        let split_byte_index = text
+            .char_indices()
+            .nth(config::MAX_LEN_CHARS)
+            .map(|(index, _)| index);
+
+        match split_byte_index {
+            None => None,
+            Some(split_index) => {
+                let preview: String = text.chars().take(20).collect();
+                eprintln!(
+                    "WARNING: {} '{}...' (len {}) exceeded max len {}. Splitting.",
+                    label,
+                    preview,
+                    text.chars().count(),
+                    config::MAX_LEN_CHARS
+                );
+
+                let mut remainder = text.split_off(split_index);
+                let mut chunks = Vec::new();
+
+                loop {
+                    match remainder.char_indices().nth(config::MAX_LEN_CHARS) {
+                        Some((next_split_index, _)) => {
+                            let tail = remainder.split_off(next_split_index);
+                            chunks.push(remainder);
+                            remainder = tail;
+                        }
+                        None => {
+                            chunks.push(remainder);
+                            break;
+                        }
+                    }
+                }
+
+                Some(chunks)
+            }
+        }
+    }
+
+    fn truncate_warn(text: &mut String, label: &str) {
+        if let Some((byte_index, _)) = text.char_indices().nth(config::MAX_LEN_CHARS) {
+            let preview: String = text.chars().take(20).collect();
+
+            eprintln!(
+                "WARNING: {} '{}...' (len {}) exceeded max len {}. Truncating.",
+                label,
+                preview,
+                text.chars().count(),
+                config::MAX_LEN_CHARS
+            );
+
+            text.truncate(byte_index);
+        }
     }
 
     fn normalize_string(text: &str) -> String {
