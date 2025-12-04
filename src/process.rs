@@ -1,15 +1,11 @@
-use std::{cmp::Ordering, iter::repeat_n};
-
 use candle_core::{Context, Error, IndexOp, Result, Tensor, bail};
 use either::Either;
 use tokenizers::{Encoding, Tokenizer};
 
-use crate::sentence_rounding::Coordinate;
-
 use super::{
-    DTYPE, ProvenceModel, ProvenceOutput,
+    ProvenceModel, ProvenceOutput,
     sentence_rounding::{
-        SentenceRoundingMode, sentence_rounding_tensor, split_sentences_and_track_from_encoding,
+        SentenceRoundingMode, sentence_rounding, split_sentences_and_track_from_encoding,
     },
 };
 
@@ -17,7 +13,6 @@ pub type MultipleQuestions = Vec<String>;
 pub type MultipleContexts = Vec<Vec<String>>;
 pub type MultipleTitles = Vec<Vec<String>>;
 pub type PreparedProcessParams = (MultipleQuestions, MultipleContexts, Option<MultipleTitles>);
-pub type FlattenedQuestionsContexts = (Vec<String>, Vec<usize>, Vec<usize>, Vec<usize>);
 pub type EncodedInput = (Encoding, Tensor, Tensor);
 
 #[derive(Debug, Clone)]
@@ -37,24 +32,18 @@ pub struct ProcessedResult {
 }
 
 pub mod config {
+    // TODO: don't hardcode
     pub const SEPARATOR_TOKEN: &str = "[SEP]";
     pub const TITLE_PARAM_SPECIAL_VALUE: &str = "first_sentence";
 }
 
-// Structure to hold CPU metadata
-struct SampleMetadata {
-    sentences_token_coords: Vec<Coordinate>,
-    source_context_text: String,
-    question_index: usize,
-    token_ids_vec: Vec<u32>,
-    separator_token_index: usize,
-}
-
 impl ProvenceModel {
+    /// Process question / context with sentence-level rounding
     #[allow(clippy::too_many_arguments)]
     pub fn process(
         &self,
         tokenizer: &Tokenizer,
+        // TODO: make slices?
         question: Either<MultipleQuestions, &str>,
         context: Either<MultipleContexts, &str>,
         title: Option<Either<MultipleTitles, &str>>,
@@ -66,43 +55,7 @@ impl ProvenceModel {
         enable_warnings: Option<bool>,
         rounding_mode: Option<SentenceRoundingMode>,
     ) -> Result<ProcessedResults> {
-        let (questions, contexts, _titles) =
-            Self::prepare_process_params(question, context, title)?;
-
-        let threshold = threshold.unwrap_or(0.1);
-        let always_select_first = always_select_first.unwrap_or(true);
-        let _batch_size = batch_size.unwrap_or(1);
-        let reorder = reorder.unwrap_or(false);
-        let top_k = top_k.unwrap_or(5);
-        let _enable_warnings = enable_warnings.unwrap_or(true);
-        let rounding_mode = rounding_mode.unwrap_or(SentenceRoundingMode::DecisionAverage);
-
-        self.process_one_at_a_time(
-            tokenizer,
-            &questions,
-            &contexts,
-            threshold,
-            always_select_first,
-            rounding_mode,
-            reorder,
-            top_k,
-        )
-    }
-
-    /// Process contexts one at a time to force Metal command buffer execution between each
-    #[allow(clippy::too_many_arguments)]
-    fn process_one_at_a_time(
-        &self,
-        tokenizer: &Tokenizer,
-        questions: &[String],
-        contexts: &[Vec<String>],
-        threshold: f32,
-        always_select_first: bool,
-        rounding_mode: SentenceRoundingMode,
-        reorder: bool,
-        top_k: usize,
-    ) -> Result<ProcessedResults> {
-        let start = std::time::Instant::now();
+        let (questions, contexts, titles) = Self::prepare_process_params(question, context, title)?;
 
         if questions.is_empty() {
             return Ok(ProcessedResults {
@@ -112,111 +65,109 @@ impl ProvenceModel {
             });
         }
 
-        let mut pruned_context_by_question = vec![Vec::new(); questions.len()];
-        let mut reranking_by_question = vec![Vec::new(); questions.len()];
-        let mut compression_by_question = vec![Vec::new(); questions.len()];
+        let threshold = threshold.unwrap_or(0.1);
+        let always_select_first = always_select_first.unwrap_or(true);
+        let batch_size = batch_size.unwrap_or(32);
+        let reorder = reorder.unwrap_or(false);
+        let top_k = top_k.unwrap_or(5);
+        let enable_warnings = enable_warnings.unwrap_or(true);
+        let rounding_mode = rounding_mode.unwrap_or(SentenceRoundingMode::DecisionAverage);
 
-        // Process each question's contexts one at a time
-        for (question_idx, question) in questions.iter().enumerate() {
-            let question_contexts = contexts
-                .get(question_idx)
-                .context(format!("Missing contexts for question {}", question_idx))?;
+        let mut pruned_context = Vec::with_capacity(questions.len());
+        let mut reranking_score = Vec::with_capacity(questions.len());
+        let mut compression_rate = Vec::with_capacity(questions.len());
 
-            for (context_idx, context) in question_contexts.iter().enumerate() {
-                println!("\n=== Processing Q{} C{} ===", question_idx, context_idx);
+        for (question_i, question) in questions.iter().enumerate() {
+            let question_contexts = contexts.get(question_i).context(format!(
+                "Couldn't get contexts for index {question_i} value {question}",
+            ))?;
 
-                // Process single context
-                let single_result = self.process_single_context(
+            let mut context_buffer = Vec::with_capacity(question_contexts.len());
+            let mut reranking_buffer = Vec::with_capacity(question_contexts.len());
+            let mut compression_buffer = Vec::with_capacity(question_contexts.len());
+
+            for (context_i, context) in question_contexts.iter().enumerate() {
+                let context = match titles {
+                    Some(ref titles) => {
+                        let context_title = titles
+                            .get(question_i)
+                            .context(format!(
+                                "Couldn't get outer titles vec at index {question_i}"
+                            ))?
+                            .get(context_i)
+                            .context(format!(
+                                "Couldn't get inner title value at index {context_i}"
+                            ))?;
+
+                        format!("{context_title} {context}")
+                    }
+                    None => context.to_owned(),
+                };
+
+                // TODO: tokenizer questions / sep / context separately, cache, then combine for forward?
+                let result = self.process_question_context(
                     tokenizer,
                     question,
-                    context,
+                    context.as_str(),
                     threshold,
                     always_select_first,
                     &rounding_mode,
                 )?;
 
-                pruned_context_by_question
-                    .get_mut(question_idx)
-                    .context("Missing pruned_context bucket")?
-                    .push(single_result.pruned_context);
-
-                reranking_by_question
-                    .get_mut(question_idx)
-                    .context("Missing reranking bucket")?
-                    .push(single_result.reranking_score);
-
-                compression_by_question
-                    .get_mut(question_idx)
-                    .context("Missing compression bucket")?
-                    .push(single_result.compression_rate);
-
-                println!("  elapsed: {:?}", start.elapsed());
+                context_buffer.push(result.pruned_context);
+                reranking_buffer.push(result.reranking_score);
+                compression_buffer.push(result.compression_rate);
             }
-        }
 
-        println!("\nAll contexts complete: {:?}", start.elapsed());
+            if reorder {
+                let mut combined: Vec<_> = reranking_buffer
+                    .into_iter()
+                    .zip(context_buffer) // yields (score, context)
+                    .zip(compression_buffer) // yields ((score, context), compress)
+                    .map(|((rerank_score, context), compression)| {
+                        (rerank_score, context, compression)
+                    }) // flatten the tuple structure
+                    .collect();
 
-        // Reorder logic
-        if reorder {
-            for question_i in 0..questions.len() {
-                let contexts_for_question = pruned_context_by_question
-                    .get_mut(question_i)
-                    .context("Missing pruned_context bucket for reorder")?;
-
-                let reranking_scores_for_question = reranking_by_question
-                    .get_mut(question_i)
-                    .context("Missing reranking bucket for reorder")?;
-
-                let compression_rates_for_question = compression_by_question
-                    .get_mut(question_i)
-                    .context("Missing compression bucket for reorder")?;
-
-                let mut sorted_indices: Vec<usize> =
-                    (0..reranking_scores_for_question.len()).collect();
-
-                sorted_indices.sort_by(|&a, &b| {
-                    let a_val = *reranking_scores_for_question.get(a).unwrap_or(&0.0);
-                    let b_val = *reranking_scores_for_question.get(b).unwrap_or(&0.0);
-
-                    b_val.partial_cmp(&a_val).unwrap_or(Ordering::Equal)
+                combined.sort_by(|(rerank_a, _, _), (rerank_b, _, _)| {
+                    rerank_b
+                        .partial_cmp(rerank_a)
+                        .unwrap_or(std::cmp::Ordering::Equal)
                 });
 
-                let sorted_indices: Vec<usize> = sorted_indices.into_iter().take(top_k).collect();
+                if combined.len() > top_k {
+                    combined.truncate(top_k);
+                }
 
-                let top_contexts: Vec<String> = sorted_indices
-                    .iter()
-                    .filter_map(|&id| contexts_for_question.get(id).cloned())
-                    .collect();
+                let combined_len = combined.len();
+                let mut new_rerank = Vec::with_capacity(combined_len);
+                let mut new_context = Vec::with_capacity(combined_len);
+                let mut new_compress = Vec::with_capacity(combined_len);
 
-                let top_reranking_scores: Vec<f32> = sorted_indices
-                    .iter()
-                    .filter_map(|&id| reranking_scores_for_question.get(id).copied())
-                    .collect();
+                for (rerank_score, context, compression) in combined {
+                    new_rerank.push(rerank_score);
+                    new_context.push(context);
+                    new_compress.push(compression);
+                }
 
-                let top_compression_rates: Vec<f32> = sorted_indices
-                    .iter()
-                    .filter_map(|&id| compression_rates_for_question.get(id).copied())
-                    .collect();
-
-                *contexts_for_question = top_contexts;
-                *reranking_scores_for_question = top_reranking_scores;
-                *compression_rates_for_question = top_compression_rates;
+                reranking_buffer = new_rerank;
+                context_buffer = new_context;
+                compression_buffer = new_compress;
             }
+
+            pruned_context.push(context_buffer);
+            reranking_score.push(reranking_buffer);
+            compression_rate.push(compression_buffer);
         }
 
-        println!("post_reorder elapsed: {:?}", start.elapsed());
-        println!("TOTAL elapsed: {:?}", start.elapsed());
-
         Ok(ProcessedResults {
-            pruned_context: pruned_context_by_question,
-            reranking_score: reranking_by_question,
-            compression_rate: compression_by_question,
+            pruned_context,
+            reranking_score,
+            compression_rate,
         })
     }
 
-    /// Process a single question-context pair
-    #[allow(clippy::indexing_slicing)]
-    fn process_single_context(
+    pub fn process_question_context(
         &self,
         tokenizer: &Tokenizer,
         question: &str,
@@ -225,65 +176,51 @@ impl ProvenceModel {
         always_select_first: bool,
         rounding_mode: &SentenceRoundingMode,
     ) -> Result<ProcessedResult> {
-        let normalized_question = Self::normalize_string(question);
-        let input_text = Self::format_input(&normalized_question, context);
+        // TODO: check python implementation
+        let normalize_question = true;
 
-        // Tokenize
-        let encoding = tokenizer
-            .encode(input_text, true)
-            .map_err(|e| Error::msg(format!("Tokenization failed: {}", e)))?;
+        let input_text;
+        let context_start_byte;
 
-        let context_start_offset =
-            normalized_question.len() + 1 + config::SEPARATOR_TOKEN.len() + 1;
+        if normalize_question {
+            let normalized_question = Self::normalize_string(question);
 
-        // Extract sentence coordinates
-        let (_sentences, sentences_token_coords) =
-            split_sentences_and_track_from_encoding(context, &encoding, context_start_offset)?;
+            input_text = Self::format_input(&normalized_question, context);
+            context_start_byte = normalized_question.len() + 1 + config::SEPARATOR_TOKEN.len() + 1;
+        } else {
+            input_text = Self::format_input(question, context);
+            context_start_byte = question.len() + 1 + config::SEPARATOR_TOKEN.len() + 1;
+        };
 
-        let token_ids_vec: Vec<u32> = encoding.get_ids().to_vec();
-        let separator_token_id = tokenizer
-            .token_to_id(config::SEPARATOR_TOKEN)
-            .context("Separator token not in tokenizer vocabulary")?;
+        let (encoding, input_ids, attention_mask) = self.encode_input(tokenizer, &input_text)?;
+        let tokens = encoding.get_ids();
 
-        let separator_token_index = token_ids_vec
-            .iter()
-            .position(|&id| id == separator_token_id)
-            .context("separator token missing")?;
+        let separator_index =
+            Self::get_separator_index(&encoding).context("separator token missing")?;
 
-        // Create tensors
-        let input_ids = Tensor::new(encoding.get_ids(), &self.device)?.unsqueeze(0)?;
-        let attention_mask =
-            Tensor::new(encoding.get_attention_mask(), &self.device)?.unsqueeze(0)?;
-
-        // Forward pass
         let output = self.forward(&input_ids, Some(attention_mask))?;
 
-        // Calculate keep probabilities
-        let keep_probs_all = Self::calculate_keep_probs(&output.compression_logits)?;
-        let sample_keep_probs = keep_probs_all.i(0)?.narrow(0, 0, encoding.len())?;
+        let ranking_scores = output.ranking_scores.to_vec1::<f32>()?;
+        let reranking_score = ranking_scores
+            .first()
+            .copied()
+            .context("ranking_scores was empty")?;
 
-        // Sentence rounding
-        let keep_mask_tensor = sentence_rounding_tensor(
-            &sample_keep_probs,
+        let (_sentence_texts, sentences_token_coords) =
+            split_sentences_and_track_from_encoding(context, &encoding, context_start_byte)?;
+
+        let keep_probs = Self::get_keep_probabilities(&output)?;
+        let keep_mask = sentence_rounding(
+            &keep_probs,
             &sentences_token_coords,
             threshold,
             always_select_first,
-            rounding_mode,
+            &rounding_mode,
         )?;
 
-        // Transfer from GPU (forces execution)
-        let reranking_score = output.ranking_scores.to_vec1::<f32>()?[0];
-        let keep_mask: Vec<bool> = keep_mask_tensor
-            .to_vec1::<u8>()?
-            .into_iter()
-            .map(|x| x != 0)
-            .collect();
-
-        // Filter tokens
         let (kept_token_ids, _removed_token_ids) =
-            Self::group_context_tokens(&token_ids_vec, separator_token_index, &keep_mask);
+            Self::group_context_tokens(tokens, separator_index, &keep_mask);
 
-        // Decode
         let pruned_context = tokenizer
             .decode(&kept_token_ids, true)
             .map_err(|e| Error::msg(format!("Decoding failed: {}", e)))?;
@@ -291,8 +228,8 @@ impl ProvenceModel {
         let compression_rate = Self::calculate_compression_rate(context, &pruned_context);
 
         Ok(ProcessedResult {
-            question: question.to_string(),
-            context: context.to_string(),
+            question: question.to_owned(),
+            context: context.to_owned(),
             pruned_context,
             reranking_score,
             compression_rate,
@@ -361,100 +298,6 @@ impl ProvenceModel {
         }
 
         Ok((questions, contexts, titles))
-    }
-
-    fn get_questions_contexts_pairs(
-        questions: &[String],
-        contexts: &[Vec<String>],
-    ) -> Result<FlattenedQuestionsContexts> {
-        let mut pair_input_texts = Vec::new();
-        let mut pair_question_indices = Vec::new();
-        let mut pair_context_indices = Vec::new();
-        let mut pair_context_start_offset_bytes = Vec::new();
-
-        for (question_i, question) in questions.iter().enumerate() {
-            let normalize_question = true;
-
-            let normalized_question = if normalize_question {
-                Self::normalize_string(question)
-            } else {
-                question.to_string()
-            };
-
-            let question_contexts = contexts.get(question_i).context(format!(
-                "Couldn't get contexts for question index {question_i}"
-            ))?;
-
-            for (context_i, context) in question_contexts.iter().enumerate() {
-                let input = Self::format_input(&normalized_question, context);
-                let context_start =
-                    normalized_question.len() + 1 + config::SEPARATOR_TOKEN.len() + 1;
-
-                pair_input_texts.push(input);
-                pair_question_indices.push(question_i);
-                pair_context_indices.push(context_i);
-                pair_context_start_offset_bytes.push(context_start);
-            }
-        }
-
-        Ok((
-            pair_input_texts,
-            pair_question_indices,
-            pair_context_indices,
-            pair_context_start_offset_bytes,
-        ))
-    }
-
-    fn batch_from_encodings(
-        encodings: &[Encoding],
-        pad_id: u32,
-        device: &candle_core::Device,
-    ) -> Result<(Tensor, Tensor, Vec<usize>)> {
-        let batch_size = encodings.len();
-
-        if batch_size == 0 {
-            let empty = Tensor::zeros(0, DTYPE, device)?.reshape((0, 0))?;
-
-            return Ok((empty.clone(), empty, Vec::new()));
-        }
-
-        let sequence_lens: Vec<usize> = encodings.iter().map(|e| e.len()).collect();
-
-        let max_len = *sequence_lens
-            .iter()
-            .max()
-            .context("batch_from_encodings: couldn't get max_len")?;
-
-        let mut all_ids = Vec::with_capacity(batch_size * max_len);
-        let mut all_masks = Vec::with_capacity(batch_size * max_len);
-
-        for encoding in encodings {
-            let ids = encoding.get_ids();
-            let mask = encoding.get_attention_mask();
-            let encoding_len = ids.len();
-            let padding_amount = max_len - encoding_len;
-
-            all_ids.extend_from_slice(ids);
-            all_ids.extend(repeat_n(pad_id, padding_amount));
-
-            all_masks.extend_from_slice(mask);
-            all_masks.extend(repeat_n(0, padding_amount));
-        }
-
-        let input_ids = Tensor::from_vec(all_ids, (batch_size, max_len), device)?;
-        let attention_mask = Tensor::from_vec(all_masks, (batch_size, max_len), device)?;
-
-        Ok((input_ids, attention_mask, sequence_lens))
-    }
-
-    fn calculate_keep_probs(compression_logits: &Tensor) -> Result<Tensor> {
-        let keep_prob_index = 1;
-
-        let compression_dims = compression_logits.dims().len();
-        let softmax_axis = compression_dims - 1;
-        let compression_probs = candle_nn::ops::softmax(compression_logits, softmax_axis)?;
-
-        compression_probs.i((.., .., keep_prob_index))
     }
 
     fn normalize_string(text: &str) -> String {
