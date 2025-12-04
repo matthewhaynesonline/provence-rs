@@ -96,7 +96,3 @@ flash-attn = ["cuda", "candle-transformers/flash-attn", "dep:candle-flash-attn"]
 metal = ["candle-core/metal", "candle-nn/metal"]
 provence-process = []
 punkt = ["dep:punkt"]
-
-# [[example]]
-# name = "bert"
-# path = "examples/bert/main.rs"
