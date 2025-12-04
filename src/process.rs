@@ -67,11 +67,13 @@ impl ProvenceModel {
 
         let threshold = threshold.unwrap_or(0.1);
         let always_select_first = always_select_first.unwrap_or(true);
-        let batch_size = batch_size.unwrap_or(32);
         let reorder = reorder.unwrap_or(false);
         let top_k = top_k.unwrap_or(5);
-        let enable_warnings = enable_warnings.unwrap_or(true);
         let rounding_mode = rounding_mode.unwrap_or(SentenceRoundingMode::DecisionAverage);
+
+        // TODO implement
+        let _batch_size = batch_size.unwrap_or(32);
+        let _enable_warnings = enable_warnings.unwrap_or(true);
 
         let mut pruned_context = Vec::with_capacity(questions.len());
         let mut reranking_score = Vec::with_capacity(questions.len());
@@ -180,16 +182,17 @@ impl ProvenceModel {
         let normalize_question = true;
 
         let input_text;
-        let context_start_byte;
+        let context_start_offset;
 
         if normalize_question {
             let normalized_question = Self::normalize_string(question);
 
             input_text = Self::format_input(&normalized_question, context);
-            context_start_byte = normalized_question.len() + 1 + config::SEPARATOR_TOKEN.len() + 1;
+            context_start_offset =
+                normalized_question.len() + 1 + config::SEPARATOR_TOKEN.len() + 1;
         } else {
             input_text = Self::format_input(question, context);
-            context_start_byte = question.len() + 1 + config::SEPARATOR_TOKEN.len() + 1;
+            context_start_offset = question.len() + 1 + config::SEPARATOR_TOKEN.len() + 1;
         };
 
         let (encoding, input_ids, attention_mask) = self.encode_input(tokenizer, &input_text)?;
@@ -206,8 +209,11 @@ impl ProvenceModel {
             .copied()
             .context("ranking_scores was empty")?;
 
-        let (_sentence_texts, sentences_token_coords) =
-            split_sentences_and_track_from_encoding(context, &encoding, context_start_byte)?;
+        let (_sentence_texts, sentences_token_coords) = split_sentences_and_track_from_encoding(
+            context,
+            encoding.get_offsets(),
+            context_start_offset,
+        )?;
 
         let keep_probs = Self::get_keep_probabilities(&output)?;
         let keep_mask = sentence_rounding(
@@ -215,11 +221,11 @@ impl ProvenceModel {
             &sentences_token_coords,
             threshold,
             always_select_first,
-            &rounding_mode,
+            rounding_mode,
         )?;
 
         let (kept_token_ids, _removed_token_ids) =
-            Self::group_context_tokens(tokens, separator_index, &keep_mask);
+            Self::group_context_tokens(&tokens, separator_index, &keep_mask);
 
         let pruned_context = tokenizer
             .decode(&kept_token_ids, true)
