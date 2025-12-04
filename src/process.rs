@@ -2,7 +2,7 @@ use candle_core::{Context, Error, IndexOp, Result, Tensor, bail};
 use either::Either;
 use tokenizers::{Encoding, Tokenizer};
 
-use crate::{ProvenceModel, ProvenceOutput, sentence_rounding::split_and_round_sentences};
+use crate::{ProvenceModel, ProvenceOutput, sentence_rounding::split_and_round_sentences_tensor};
 
 pub type MultipleQuestions = Vec<String>;
 pub type MultipleContexts = Vec<Vec<String>>;
@@ -203,8 +203,8 @@ impl ProvenceModel {
             .copied()
             .context("ranking_scores was empty")?;
 
-        let keep_probs = Self::get_keep_probabilities(&output)?;
-        let keep_mask = split_and_round_sentences(
+        let keep_probs = Self::get_keep_probabilities_tensor(&output)?;
+        let keep_mask = split_and_round_sentences_tensor(
             context,
             encoding.get_offsets(),
             context_start_offset,
@@ -452,13 +452,16 @@ impl ProvenceModel {
     }
 
     fn get_keep_probabilities(output: &ProvenceOutput) -> Result<Vec<f32>> {
+        let keep_probs = Self::get_keep_probabilities_tensor(output)?;
+
+        keep_probs.to_vec1::<f32>()
+    }
+
+    fn get_keep_probabilities_tensor(output: &ProvenceOutput) -> Result<Tensor> {
         let compression_logits = output.compression_logits.squeeze(0)?;
         let compression_probs = candle_nn::ops::softmax(&compression_logits, 1)?;
 
-        let keep_probs = compression_probs.i((.., 1))?;
-        let keep_probs_vec = keep_probs.to_vec1::<f32>()?;
-
-        Ok(keep_probs_vec)
+        compression_probs.i((.., 1))
     }
 
     fn apply_keep_mask_after_skip(
