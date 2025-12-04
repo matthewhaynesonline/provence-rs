@@ -10,7 +10,7 @@ use hf_hub::{Repo, RepoType, api::sync::Api};
 use tokenizers::{Encoding, PaddingParams, Tokenizer};
 
 use candle_shims::utils::device::get_device;
-use provence_rs::{ProvenceModel, sentence_rounding::SentenceRoundingMode};
+use provence_rs::ProvenceModel;
 
 enum TaskType {
     Single(Box<ProvenceModel>),
@@ -87,10 +87,6 @@ struct Args {
     /// Always select first sentence
     #[arg(long, default_value_t = true)]
     always_select_first: bool,
-
-    /// Which sentence rounding mode to use
-    #[arg(long, default_value_t = SentenceRoundingMode::DecisionAverage)]
-    rounding_mode: SentenceRoundingMode,
 
     /// Which task to run
     #[arg(long, default_value_t = ArgsTask::Single)]
@@ -198,7 +194,6 @@ fn main() -> Result<()> {
                 Some(true),
                 None,
                 None,
-                Some(args.rounding_mode),
             )?;
 
             let duration = start.elapsed();

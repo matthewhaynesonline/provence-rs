@@ -8,42 +8,6 @@ pub mod config {
     pub const SENTENCE_ENDING: &[char] = &['.', '!', '?'];
 }
 
-#[derive(Debug, Clone)]
-pub enum SentenceRoundingMode {
-    /// Apply the `threshold` to every single token in a sentence, converting to a binary
-    /// `True` (1) or `False` (0), then averages these binary values.
-    /// This is the method from the original Python implementation.
-    DecisionAverage,
-    /// Take the probabilities for every token in a sentence, calculates their average,
-    /// and then compares that average to the threshold.
-    /// This is new for the Rust implementation.
-    ProbabilityAverage,
-}
-
-impl std::fmt::Display for SentenceRoundingMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            Self::ProbabilityAverage => write!(f, "probability_average"),
-            Self::DecisionAverage => write!(f, "decision_average"),
-        }
-    }
-}
-
-impl std::str::FromStr for SentenceRoundingMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "probability_average" => Ok(Self::ProbabilityAverage),
-            "decision_average" => Ok(Self::DecisionAverage),
-            _ => Err(format!(
-                "Invalid rounding mode: '{}'. Valid options are: probability_average, decision_average",
-                s
-            )),
-        }
-    }
-}
-
 /// Apply sentence-level rounding to token predictions.
 ///
 /// A sentence is kept if the mean probability of its tokens exceeds `threshold`
@@ -54,7 +18,6 @@ pub fn sentence_rounding(
     sentences_token_coords: &[Offsets],
     threshold: f32,
     always_select_first: bool,
-    rounding_mode: &SentenceRoundingMode,
 ) -> Result<Vec<bool>> {
     if sentences_token_coords.is_empty() {
         bail!("sentences_token_coords is empty");
@@ -81,38 +44,23 @@ pub fn sentence_rounding(
             coord.0, coord.1
         ))?;
 
-        let (tokens_sum, tokens_count) = match rounding_mode {
-            SentenceRoundingMode::ProbabilityAverage => {
-                token_coords
-                    .iter()
-                    .copied()
-                    .fold((0.0, 0), |(sum, count), token_keep_prob| {
-                        if token_keep_prob.is_nan() {
-                            (sum, count)
+        let (tokens_sum, tokens_count) =
+            token_coords
+                .iter()
+                .copied()
+                .fold((0.0, 0), |(sum, count), token_keep_prob| {
+                    if token_keep_prob.is_nan() {
+                        (sum, count)
+                    } else {
+                        let token_decision = if token_keep_prob > threshold {
+                            1.0
                         } else {
-                            (sum + token_keep_prob, count + 1)
-                        }
-                    })
-            }
-            SentenceRoundingMode::DecisionAverage => {
-                token_coords
-                    .iter()
-                    .copied()
-                    .fold((0.0, 0), |(sum, count), token_keep_prob| {
-                        if token_keep_prob.is_nan() {
-                            (sum, count)
-                        } else {
-                            let token_decision = if token_keep_prob > threshold {
-                                1.0
-                            } else {
-                                0.0
-                            };
+                            0.0
+                        };
 
-                            (sum + token_decision, count + 1)
-                        }
-                    })
-            }
-        };
+                        (sum + token_decision, count + 1)
+                    }
+                });
 
         let mean = if tokens_count == 0 {
             0.0

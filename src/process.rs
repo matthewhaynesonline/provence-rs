@@ -4,9 +4,7 @@ use tokenizers::{Encoding, Tokenizer};
 
 use crate::{
     ProvenceModel, ProvenceOutput,
-    sentence_rounding::{
-        SentenceRoundingMode, sentence_rounding, split_sentences_and_track_from_encoding,
-    },
+    sentence_rounding::{sentence_rounding, split_sentences_and_track_from_encoding},
 };
 
 pub type MultipleQuestions = Vec<String>;
@@ -57,7 +55,6 @@ impl ProvenceModel {
         reorder: Option<bool>,
         top_k: Option<usize>,
         enable_warnings: Option<bool>,
-        rounding_mode: Option<SentenceRoundingMode>,
     ) -> Result<ProcessedResults> {
         let (questions, contexts, titles) = Self::prepare_process_params(question, context, title)?;
 
@@ -77,7 +74,6 @@ impl ProvenceModel {
         let always_select_first = always_select_first.unwrap_or(true);
         let reorder = reorder.unwrap_or(false);
         let top_k = top_k.unwrap_or(5);
-        let rounding_mode = rounding_mode.unwrap_or(SentenceRoundingMode::DecisionAverage);
 
         // TODO implement
         let _batch_size = batch_size.unwrap_or(32);
@@ -129,7 +125,6 @@ impl ProvenceModel {
                     context_start_offset,
                     threshold,
                     always_select_first,
-                    &rounding_mode,
                 )?;
 
                 context_buffer.push(result.pruned_context);
@@ -194,7 +189,6 @@ impl ProvenceModel {
         context_start_offset: usize,
         threshold: f32,
         always_select_first: bool,
-        rounding_mode: &SentenceRoundingMode,
     ) -> Result<ProcessedResult> {
         let input_text = Self::format_input(question, context);
 
@@ -224,7 +218,6 @@ impl ProvenceModel {
             &sentences_token_coords,
             threshold,
             always_select_first,
-            rounding_mode,
         )?;
 
         let (kept_token_ids, _removed_token_ids) =
