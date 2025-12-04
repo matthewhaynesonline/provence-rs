@@ -84,6 +84,18 @@ impl ProvenceModel {
                 "Couldn't get contexts for index {question_i} value {question}",
             ))?;
 
+            // TODO: check python implementation
+            let normalize_question = true;
+
+            let normalized_question = if normalize_question {
+                Self::normalize_string(question)
+            } else {
+                question.to_string()
+            };
+
+            let context_start_offset =
+                normalized_question.len() + 1 + config::SEPARATOR_TOKEN.len() + 1;
+
             let mut context_buffer = Vec::with_capacity(question_contexts.len());
             let mut reranking_buffer = Vec::with_capacity(question_contexts.len());
             let mut compression_buffer = Vec::with_capacity(question_contexts.len());
@@ -109,8 +121,9 @@ impl ProvenceModel {
                 // TODO: tokenizer questions / sep / context separately, cache, then combine for forward?
                 let result = self.process_question_context(
                     tokenizer,
-                    question,
+                    &normalized_question,
                     context.as_str(),
+                    context_start_offset,
                     threshold,
                     always_select_first,
                     &rounding_mode,
@@ -169,31 +182,18 @@ impl ProvenceModel {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn process_question_context(
         &self,
         tokenizer: &Tokenizer,
         question: &str,
         context: &str,
+        context_start_offset: usize,
         threshold: f32,
         always_select_first: bool,
         rounding_mode: &SentenceRoundingMode,
     ) -> Result<ProcessedResult> {
-        // TODO: check python implementation
-        let normalize_question = true;
-
-        let input_text;
-        let context_start_offset;
-
-        if normalize_question {
-            let normalized_question = Self::normalize_string(question);
-
-            input_text = Self::format_input(&normalized_question, context);
-            context_start_offset =
-                normalized_question.len() + 1 + config::SEPARATOR_TOKEN.len() + 1;
-        } else {
-            input_text = Self::format_input(question, context);
-            context_start_offset = question.len() + 1 + config::SEPARATOR_TOKEN.len() + 1;
-        };
+        let input_text = Self::format_input(question, context);
 
         let (encoding, input_ids, attention_mask) = self.encode_input(tokenizer, &input_text)?;
         let tokens = encoding.get_ids();
@@ -225,7 +225,7 @@ impl ProvenceModel {
         )?;
 
         let (kept_token_ids, _removed_token_ids) =
-            Self::group_context_tokens(&tokens, separator_index, &keep_mask);
+            Self::group_context_tokens(tokens, separator_index, &keep_mask);
 
         let pruned_context = tokenizer
             .decode(&kept_token_ids, true)
