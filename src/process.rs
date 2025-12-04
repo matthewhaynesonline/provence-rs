@@ -4,6 +4,8 @@ use candle_core::{Context, Error, IndexOp, Result, Tensor, bail};
 use either::Either;
 use tokenizers::{Encoding, Tokenizer};
 
+use crate::sentence_rounding::Coordinate;
+
 use super::{
     DTYPE, ProvenceModel, ProvenceOutput,
     sentence_rounding::{
@@ -35,13 +37,20 @@ pub struct ProcessedResult {
 }
 
 pub mod config {
-    // TODO: don't hardcode
     pub const SEPARATOR_TOKEN: &str = "[SEP]";
     pub const TITLE_PARAM_SPECIAL_VALUE: &str = "first_sentence";
 }
 
+// Structure to hold CPU metadata
+struct SampleMetadata {
+    sentences_token_coords: Vec<Coordinate>,
+    source_context_text: String,
+    question_index: usize,
+    token_ids_vec: Vec<u32>,
+    separator_token_index: usize,
+}
+
 impl ProvenceModel {
-    /// Process question / context with sentence-level rounding
     #[allow(clippy::too_many_arguments)]
     pub fn process(
         &self,
@@ -62,27 +71,27 @@ impl ProvenceModel {
 
         let threshold = threshold.unwrap_or(0.1);
         let always_select_first = always_select_first.unwrap_or(true);
-        let batch_size = batch_size.unwrap_or(32);
+        let _batch_size = batch_size.unwrap_or(1);
         let reorder = reorder.unwrap_or(false);
         let top_k = top_k.unwrap_or(5);
         let _enable_warnings = enable_warnings.unwrap_or(true);
         let rounding_mode = rounding_mode.unwrap_or(SentenceRoundingMode::DecisionAverage);
 
-        self.process_batched(
+        self.process_one_at_a_time(
             tokenizer,
             &questions,
             &contexts,
             threshold,
             always_select_first,
             rounding_mode,
-            batch_size,
             reorder,
             top_k,
         )
     }
 
+    /// Process contexts one at a time to force Metal command buffer execution between each
     #[allow(clippy::too_many_arguments)]
-    pub fn process_batched(
+    fn process_one_at_a_time(
         &self,
         tokenizer: &Tokenizer,
         questions: &[String],
@@ -90,7 +99,6 @@ impl ProvenceModel {
         threshold: f32,
         always_select_first: bool,
         rounding_mode: SentenceRoundingMode,
-        batch_size: usize,
         reorder: bool,
         top_k: usize,
     ) -> Result<ProcessedResults> {
@@ -104,292 +112,49 @@ impl ProvenceModel {
             });
         }
 
-        let (
-            pair_input_texts,
-            pair_question_indices,
-            pair_context_indices,
-            pair_context_start_offsets,
-        ) = Self::get_questions_contexts_pairs(questions, contexts)?;
-
-        if pair_input_texts.is_empty() {
-            return Ok(ProcessedResults {
-                pruned_context: vec![Vec::new(); questions.len()],
-                reranking_score: vec![Vec::new(); questions.len()],
-                compression_rate: vec![Vec::new(); questions.len()],
-            });
-        }
-
-        println!(
-            "get_questions_contexts_pairs time elapsed: {:?}",
-            start.elapsed()
-        );
-
         let mut pruned_context_by_question = vec![Vec::new(); questions.len()];
         let mut reranking_by_question = vec![Vec::new(); questions.len()];
         let mut compression_by_question = vec![Vec::new(); questions.len()];
 
-        let encodings = tokenizer
-            .encode_batch(pair_input_texts, true)
-            .map_err(|e| Error::msg(format!("encode_batch failed: {}", e)))?;
+        // Process each question's contexts one at a time
+        for (question_idx, question) in questions.iter().enumerate() {
+            let question_contexts = contexts
+                .get(question_idx)
+                .context(format!("Missing contexts for question {}", question_idx))?;
 
-        println!("encode_batch time elapsed: {:?}", start.elapsed());
+            for (context_idx, context) in question_contexts.iter().enumerate() {
+                println!("\n=== Processing Q{} C{} ===", question_idx, context_idx);
 
-        let total_pair_count = encodings.len();
-        let pad_id = tokenizer.get_padding().map(|p| p.pad_id).unwrap_or(0);
-        let separator_token_id = tokenizer
-            .token_to_id(config::SEPARATOR_TOKEN)
-            .context("Separator token not in tokenizer vocabulary")?;
-
-        let mut pair_cursor = 0;
-
-        while pair_cursor < total_pair_count {
-            let chunk_end = std::cmp::min(pair_cursor + batch_size, total_pair_count);
-
-            let encoding_chunk = encodings
-                .get(pair_cursor..chunk_end)
-                .context("Failed to get encoding chunk")?;
-
-            let (input_ids, attention_mask, sequence_lens) =
-                Self::batch_from_encodings(encoding_chunk, pad_id, &self.device)?;
-
-            println!(
-                "while batch_from_encodings pair_cursor {} elapsed: {:?}",
-                pair_cursor,
-                start.elapsed()
-            );
-
-            let output = self.forward(&input_ids, Some(attention_mask))?;
-
-            println!(
-                "while output pair_cursor {} elapsed: {:?}",
-                pair_cursor,
-                start.elapsed()
-            );
-
-            let keep_probs_all = Self::calculate_keep_probs(&output.compression_logits)?;
-            let ranking_scores = &output.ranking_scores;
-
-            println!(
-                "while calculate_keep_probs pair_cursor {} elapsed: {:?}",
-                pair_cursor,
-                start.elapsed()
-            );
-
-            // ====================================================================
-            // STEP 1: CPU-side metadata extraction (encodings only)
-            // ====================================================================
-            let mut batch_metadata = Vec::with_capacity(encoding_chunk.len());
-
-            for chunk_local_index in 0..encoding_chunk.len() {
-                let pair_global_index = pair_cursor + chunk_local_index;
-
-                let sample_encoding = encoding_chunk
-                    .get(chunk_local_index)
-                    .context("Failed to get encoding for sample")?;
-
-                let context_start_offset = *pair_context_start_offsets
-                    .get(pair_global_index)
-                    .context("Failed to get context_start_offset for sample")?;
-
-                let source_context_text = {
-                    let question_index = *pair_question_indices
-                        .get(pair_global_index)
-                        .context("Missing question mapping")?;
-
-                    let context_index = *pair_context_indices
-                        .get(pair_global_index)
-                        .context("Missing context mapping")?;
-
-                    contexts
-                        .get(question_index)
-                        .and_then(|v| v.get(context_index))
-                        .context("Missing original context text")?
-                        .to_owned()
-                };
-
-                let (_sentences, sentences_token_coords) = split_sentences_and_track_from_encoding(
-                    &source_context_text,
-                    sample_encoding,
-                    context_start_offset,
-                )?;
-
-                let question_index = *pair_question_indices
-                    .get(pair_global_index)
-                    .context("Missing question mapping")?;
-
-                batch_metadata.push((sentences_token_coords, source_context_text, question_index));
-            }
-
-            println!(
-                "while extract_metadata pair_cursor {} elapsed: {:?}",
-                pair_cursor,
-                start.elapsed()
-            );
-
-            // ====================================================================
-            // STEP 2: GPU processing - build keep masks on GPU
-            // NO GPU→CPU TRANSFERS in this section
-            // ====================================================================
-            let mut keep_mask_tensors = Vec::with_capacity(encoding_chunk.len());
-
-            for chunk_local_index in 0..encoding_chunk.len() {
-                let sample_sequence_len = *sequence_lens
-                    .get(chunk_local_index)
-                    .context("Failed to get sequence_len for sample")?;
-
-                println!(
-                    "for while sample_sequence_len chunk_local_index {} pair_cursor {} elapsed: {:?}",
-                    chunk_local_index,
-                    pair_cursor,
-                    start.elapsed()
-                );
-
-                // GPU slice, no transfer
-                let sample_keep_probs_tensor =
-                    keep_probs_all
-                        .i(chunk_local_index)?
-                        .narrow(0, 0, sample_sequence_len)?;
-
-                println!(
-                    "for while sample_keep_probs_tensor chunk_local_index {} pair_cursor {} elapsed: {:?}",
-                    chunk_local_index,
-                    pair_cursor,
-                    start.elapsed()
-                );
-
-                let (sentences_token_coords, _, _) = batch_metadata
-                    .get(chunk_local_index)
-                    .context("Failed to get batch metadata")?;
-
-                println!(
-                    "for while sample_keep_probs_tensor chunk_local_index {} pair_cursor {} elapsed: {:?}",
-                    chunk_local_index,
-                    pair_cursor,
-                    start.elapsed()
-                );
-
-                // Build keep mask on GPU
-                let keep_mask_tensor = sentence_rounding_tensor(
-                    &sample_keep_probs_tensor,
-                    sentences_token_coords,
+                // Process single context
+                let single_result = self.process_single_context(
+                    tokenizer,
+                    question,
+                    context,
                     threshold,
                     always_select_first,
                     &rounding_mode,
                 )?;
 
-                println!(
-                    "for while keep_mask_tensor chunk_local_index {} pair_cursor {} elapsed: {:?}",
-                    chunk_local_index,
-                    pair_cursor,
-                    start.elapsed()
-                );
-
-                keep_mask_tensors.push(keep_mask_tensor);
-
-                println!(
-                    "for while keep_mask_tensors.push chunk_local_index {} pair_cursor {} elapsed: {:?}",
-                    chunk_local_index,
-                    pair_cursor,
-                    start.elapsed()
-                );
-            }
-
-            println!(
-                "while build_keep_masks pair_cursor {} elapsed: {:?}",
-                pair_cursor,
-                start.elapsed()
-            );
-
-            // ====================================================================
-            // STEP 3: SINGLE BATCH GPU→CPU TRANSFER
-            // Transfer all data at once to minimize sync overhead
-            // ====================================================================
-
-            // Transfer all ranking scores in one go
-            let all_ranking_scores: Vec<f32> = ranking_scores.to_vec1()?;
-
-            // Transfer all input IDs in one go
-            let all_input_ids: Vec<Vec<u32>> = (0..encoding_chunk.len())
-                .map(|i| input_ids.i(i)?.to_vec1())
-                .collect::<Result<Vec<_>>>()?;
-
-            // Transfer all keep masks in one go
-            let all_keep_masks: Vec<Vec<bool>> = keep_mask_tensors
-                .iter()
-                .map(|mask| {
-                    mask.to_vec1::<u8>()
-                        .map(|v| v.into_iter().map(|x| x != 0).collect())
-                })
-                .collect::<Result<Vec<_>>>()?;
-
-            println!(
-                "while transfer_from_gpu pair_cursor {} elapsed: {:?}",
-                pair_cursor,
-                start.elapsed()
-            );
-
-            // ====================================================================
-            // STEP 4: CPU-side post-processing (decoding, etc.)
-            // ====================================================================
-            for chunk_local_index in 0..encoding_chunk.len() {
-                let sample_reranking_score = *all_ranking_scores
-                    .get(chunk_local_index)
-                    .context("Failed to get ranking score")?;
-
-                let token_ids_vec = all_input_ids
-                    .get(chunk_local_index)
-                    .context("Failed to get token IDs")?;
-
-                let keep_mask = all_keep_masks
-                    .get(chunk_local_index)
-                    .context("Failed to get keep mask")?;
-
-                // Find separator
-                let separator_token_index = token_ids_vec
-                    .iter()
-                    .position(|&id| id == separator_token_id)
-                    .context("separator token missing")?;
-
-                let (_, source_context_text, question_index) = batch_metadata
-                    .get(chunk_local_index)
-                    .context("Failed to get batch metadata")?;
-
-                let (kept_token_ids, _removed_token_ids) =
-                    Self::group_context_tokens(token_ids_vec, separator_token_index, keep_mask);
-
-                let pruned_context = tokenizer
-                    .decode(&kept_token_ids, true)
-                    .map_err(|e| Error::msg(format!("Decoding failed: {}", e)))?;
-
-                let compression_rate =
-                    Self::calculate_compression_rate(source_context_text, &pruned_context);
-
                 pruned_context_by_question
-                    .get_mut(*question_index)
+                    .get_mut(question_idx)
                     .context("Missing pruned_context bucket")?
-                    .push(pruned_context);
+                    .push(single_result.pruned_context);
 
                 reranking_by_question
-                    .get_mut(*question_index)
+                    .get_mut(question_idx)
                     .context("Missing reranking bucket")?
-                    .push(sample_reranking_score);
+                    .push(single_result.reranking_score);
 
                 compression_by_question
-                    .get_mut(*question_index)
+                    .get_mut(question_idx)
                     .context("Missing compression bucket")?
-                    .push(compression_rate);
+                    .push(single_result.compression_rate);
+
+                println!("  elapsed: {:?}", start.elapsed());
             }
-
-            println!(
-                "while cpu_postprocess pair_cursor {} elapsed: {:?}",
-                pair_cursor,
-                start.elapsed()
-            );
-
-            pair_cursor = chunk_end;
         }
 
-        println!("post while time elapsed: {:?}", start.elapsed());
+        println!("\nAll contexts complete: {:?}", start.elapsed());
 
         // Reorder logic
         if reorder {
@@ -439,12 +204,98 @@ impl ProvenceModel {
             }
         }
 
-        println!("post reorder elapsed: {:?}", start.elapsed());
+        println!("post_reorder elapsed: {:?}", start.elapsed());
+        println!("TOTAL elapsed: {:?}", start.elapsed());
 
         Ok(ProcessedResults {
             pruned_context: pruned_context_by_question,
             reranking_score: reranking_by_question,
             compression_rate: compression_by_question,
+        })
+    }
+
+    /// Process a single question-context pair
+    #[allow(clippy::indexing_slicing)]
+    fn process_single_context(
+        &self,
+        tokenizer: &Tokenizer,
+        question: &str,
+        context: &str,
+        threshold: f32,
+        always_select_first: bool,
+        rounding_mode: &SentenceRoundingMode,
+    ) -> Result<ProcessedResult> {
+        let normalized_question = Self::normalize_string(question);
+        let input_text = Self::format_input(&normalized_question, context);
+
+        // Tokenize
+        let encoding = tokenizer
+            .encode(input_text, true)
+            .map_err(|e| Error::msg(format!("Tokenization failed: {}", e)))?;
+
+        let context_start_offset =
+            normalized_question.len() + 1 + config::SEPARATOR_TOKEN.len() + 1;
+
+        // Extract sentence coordinates
+        let (_sentences, sentences_token_coords) =
+            split_sentences_and_track_from_encoding(context, &encoding, context_start_offset)?;
+
+        let token_ids_vec: Vec<u32> = encoding.get_ids().to_vec();
+        let separator_token_id = tokenizer
+            .token_to_id(config::SEPARATOR_TOKEN)
+            .context("Separator token not in tokenizer vocabulary")?;
+
+        let separator_token_index = token_ids_vec
+            .iter()
+            .position(|&id| id == separator_token_id)
+            .context("separator token missing")?;
+
+        // Create tensors
+        let input_ids = Tensor::new(encoding.get_ids(), &self.device)?.unsqueeze(0)?;
+        let attention_mask =
+            Tensor::new(encoding.get_attention_mask(), &self.device)?.unsqueeze(0)?;
+
+        // Forward pass
+        let output = self.forward(&input_ids, Some(attention_mask))?;
+
+        // Calculate keep probabilities
+        let keep_probs_all = Self::calculate_keep_probs(&output.compression_logits)?;
+        let sample_keep_probs = keep_probs_all.i(0)?.narrow(0, 0, encoding.len())?;
+
+        // Sentence rounding
+        let keep_mask_tensor = sentence_rounding_tensor(
+            &sample_keep_probs,
+            &sentences_token_coords,
+            threshold,
+            always_select_first,
+            rounding_mode,
+        )?;
+
+        // Transfer from GPU (forces execution)
+        let reranking_score = output.ranking_scores.to_vec1::<f32>()?[0];
+        let keep_mask: Vec<bool> = keep_mask_tensor
+            .to_vec1::<u8>()?
+            .into_iter()
+            .map(|x| x != 0)
+            .collect();
+
+        // Filter tokens
+        let (kept_token_ids, _removed_token_ids) =
+            Self::group_context_tokens(&token_ids_vec, separator_token_index, &keep_mask);
+
+        // Decode
+        let pruned_context = tokenizer
+            .decode(&kept_token_ids, true)
+            .map_err(|e| Error::msg(format!("Decoding failed: {}", e)))?;
+
+        let compression_rate = Self::calculate_compression_rate(context, &pruned_context);
+
+        Ok(ProcessedResult {
+            question: question.to_string(),
+            context: context.to_string(),
+            pruned_context,
+            reranking_score,
+            compression_rate,
         })
     }
 
@@ -470,7 +321,6 @@ impl ProvenceModel {
         context: Either<MultipleContexts, &str>,
         title: Option<Either<MultipleTitles, &str>>,
     ) -> Result<PreparedProcessParams> {
-        // Convert input format into questions of Vec[str] and contexts/titles of Vec[Vec[str]]
         let questions = match question {
             Either::Left(q) => q,
             Either::Right(q) => vec![q.to_owned()],
@@ -607,7 +457,6 @@ impl ProvenceModel {
         compression_probs.i((.., .., keep_prob_index))
     }
 
-    // TODO: use tokenizers?
     fn normalize_string(text: &str) -> String {
         let lower_no_punctuation: String = text
             .to_lowercase()
