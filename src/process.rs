@@ -94,6 +94,11 @@ impl ProvenceModel {
             let context_start_offset =
                 normalized_question.len() + 1 + config::SEPARATOR_TOKEN.len() + 1;
 
+            let encoded_question = self.encode_input(tokenizer, &normalized_question)?;
+
+            let separator_index = Self::get_separator_index(&encoded_question.0)
+                .context("separator token missing")?;
+
             let mut context_buffer = Vec::with_capacity(question_contexts.len());
             let mut reranking_buffer = Vec::with_capacity(question_contexts.len());
             let mut compression_buffer = Vec::with_capacity(question_contexts.len());
@@ -118,9 +123,11 @@ impl ProvenceModel {
 
                 let result = self.process_question_context(
                     tokenizer,
-                    &normalized_question,
+                    normalized_question.as_str(),
                     context.as_str(),
+                    &encoded_question,
                     context_start_offset,
+                    separator_index,
                     threshold,
                     always_select_first,
                 )?;
@@ -183,17 +190,22 @@ impl ProvenceModel {
         tokenizer: &Tokenizer,
         question: &str,
         context: &str,
+        encoded_question: &EncodedInput,
         context_start_offset: usize,
+        separator_index: usize,
         threshold: f32,
         always_select_first: bool,
     ) -> Result<ProcessedResult> {
-        let mut input_text = Self::apply_template(question, context);
-        Self::truncate_warn(&mut input_text, "Process input", config::MAX_LEN_CHARS);
+        let encoded_context = self.encode_input(tokenizer, context)?;
 
-        let (encoding, input_ids, attention_mask) = self.encode_input(tokenizer, &input_text)?;
-        let tokens = encoding.get_ids();
-        let separator_index =
-            Self::get_separator_index(&encoding).context("separator token missing")?;
+        let tokens = [encoded_question.0.get_ids(), encoded_context.0.get_ids()].concat();
+        let input_ids = Tensor::cat(&[&encoded_question.1, &encoded_context.1], 1)?;
+        let attention_mask = Tensor::cat(&[&encoded_question.2, &encoded_context.2], 1)?;
+        let offsets = [
+            encoded_question.0.get_offsets(),
+            encoded_context.0.get_offsets(),
+        ]
+        .concat();
 
         let output = self.forward(&input_ids, Some(attention_mask))?;
 
@@ -206,7 +218,7 @@ impl ProvenceModel {
         let keep_probs = Self::get_keep_probabilities(&output)?;
         let keep_mask = split_and_round_sentences(
             context,
-            encoding.get_offsets(),
+            &offsets,
             context_start_offset,
             &keep_probs,
             threshold,
@@ -214,7 +226,7 @@ impl ProvenceModel {
         )?;
 
         let (kept_token_ids, _removed_token_ids) =
-            Self::apply_keep_mask_after_skip(tokens, separator_index, &keep_mask);
+            Self::apply_keep_mask_after_skip(&tokens, separator_index, &keep_mask);
 
         let pruned_context = tokenizer
             .decode(&kept_token_ids, true)
