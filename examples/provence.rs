@@ -152,12 +152,16 @@ fn main() -> Result<()> {
 
     println!("Running process helper function");
 
+    dbg!(&question);
+
+    let question = vec![question.to_string(), "What is a cottage pie?".to_string()];
+
     let start = std::time::Instant::now();
 
     let result = model.process(
         &tokenizer,
-        Either::Right(question),
-        Either::Left(vec![args.contexts.clone()]),
+        Either::Left(question),
+        Either::Left(vec![args.contexts.clone(), args.contexts.clone()]),
         None,
         Some(args.threshold),
         Some(args.always_select_first),
@@ -170,7 +174,7 @@ fn main() -> Result<()> {
     let duration = start.elapsed();
 
     println!("Simple output");
-    dbg!(&question);
+
     dbg!(&result);
 
     for inner_pruned_contexts in result.pruned_context.iter() {

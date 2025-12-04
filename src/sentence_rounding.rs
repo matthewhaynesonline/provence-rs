@@ -345,6 +345,13 @@ fn map_sentence_ranges_to_token_ranges(
         }
     }
 
+    dbg!("---------");
+    dbg!(&sentence_ranges_rel_to_context);
+    dbg!(&context_start_offset);
+    dbg!(&token_offsets);
+    dbg!(&token_offsets.len());
+    dbg!(&sentences_to_tokens_ranges);
+
     Ok(sentences_to_tokens_ranges)
 }
 
