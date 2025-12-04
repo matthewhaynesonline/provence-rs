@@ -1,12 +1,14 @@
-use std::path::PathBuf;
+use std::{fmt::Write, path::PathBuf};
 
 use anyhow::{Context, Error as E, Result, bail};
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::debertav2::Config as DebertaV2Config;
 use clap::Parser;
+use console::Style;
 use either::Either;
 use hf_hub::{Repo, RepoType, api::sync::Api};
+use similar::{ChangeTag, TextDiff};
 use tokenizers::{Encoding, PaddingParams, Tokenizer};
 
 use candle_shims::utils::device::get_device;
@@ -50,15 +52,13 @@ struct Args {
         long,
         num_args = 1..,
         default_values = &[
-            "A cottage pie is a type of meat pie made with minced or ground beef and topped with mashed potato. The dish is also known as shepherd's pie when made with lamb.",
-            "Shepherd's pie is traditionally made with lamb, while cottage pie uses beef. Both are topped with mashed potatoes and baked until golden.",
-            "Shepherd's pie. History. In early cookery books, the dish was a means of using leftover roasted meat of any kind, and the pie dish was lined on the sides and bottom with mashed potato, as well as having a mashed potato crust on top. Variations and similar dishes. Other potato-topped pies include: The modern \"Cumberland pie\" is a version with either beef or lamb and a layer of bread- crumbs and cheese on top. In medieval times, and modern-day Cumbria, the pastry crust had a filling of meat with fruits and spices.. In Quebec, a varia- tion on the cottage pie is called \"Paˆte ́ chinois\". It is made with ground beef on the bottom layer, canned corn in the middle, and mashed potato on top.. The \"shepherdess pie\" is a vegetarian version made without meat, or a vegan version made without meat and dairy.. In the Netherlands, a very similar dish called \"philosopher's stew\" () often adds ingredients like beans, apples, prunes, or apple sauce.. In Brazil, a dish called in refers to the fact that a manioc puree hides a layer of sun-dried meat.",
-            "Traditional shepherd's pie often includes diced onions, carrots, and peas mixed into the minced lamb on the bottom layer, enhancing flavor and texture before the mashed potato topping is added.",
-            "Modern variations of Shepherd's pie may use sweet potato instead of mashed potato for the topping, giving a slightly sweeter taste and different nutritional profile.",
-            "Vegetarian or vegan shepherd's pies replace the meat with lentils, mushrooms, or textured vegetable protein, while keeping the layered structure of a bottom filling, vegetables, and mashed potato on top.",
-            "In the UK, Shepherd's pie is considered comfort food and is often served with a side of peas or a simple green salad, especially during colder months.",
-            "Shepherd's pie can also include a layer of gravy or sauce on the bottom to keep the filling moist, which helps prevent the mashed potato from drying out during baking.",
-            "Cultural variations: In Ireland, shepherd's pie may incorporate Irish stout into the meat mixture for deeper flavor; in Canada, 'Pâté chinois' is a common dish in Quebec, with corn as the middle layer."
+            "A cottage pie is a type of meat pie made with minced or ground beef and topped with mashed potato. The dish is also known as shepherd's pie when made with lamb. Shepherd's pie is traditionally made with lamb, while cottage pie uses beef. Both are topped with mashed potatoes and baked until golden. In Quebec, a variation on the cottage pie is called \"Paˆte ́ chinois\". It is made with ground beef on the bottom layer, canned corn in the middle, and mashed potato on top.",
+            "Shepherd's pie. History. In early cookery books, the dish was a means of using leftover roasted meat of any kind, and the pie dish was lined on the sides and bottom with mashed potato, as well as having a mashed potato crust on top.",
+            "Variations and similar dishes. Other potato-topped pies include: The modern \"Cumberland pie\" is a version with either beef or lamb and a layer of bread- crumbs and cheese on top. In medieval times, and modern-day Cumbria, the pastry crust had a filling of meat with fruits and spices..",
+            "The \"shepherdess pie\" is a vegetarian version made without meat, or a vegan version made without meat and dairy.. In the Netherlands, a very similar dish called \"philosopher's stew\" () often adds ingredients like beans, apples, prunes, or apple sauce.. In Brazil, a dish called in refers to the fact that a manioc puree hides a layer of sun-dried meat.",
+            "Traditional shepherd's pie often includes diced onions, carrots, and peas mixed into the minced lamb on the bottom layer, enhancing flavor and texture before the mashed potato topping is added. Modern variations of Shepherd's pie may use sweet potato instead of mashed potato for the topping, giving a slightly sweeter taste and different nutritional profile.",
+            "Vegetarian or vegan shepherd's pies replace the meat with lentils, mushrooms, or textured vegetable protein, while keeping the layered structure of a bottom filling, vegetables, and mashed potato on top. Shepherd's pie can also include a layer of gravy or sauce on the bottom to keep the filling moist, which helps prevent the mashed potato from drying out during baking.",
+            "In the UK, Shepherd's pie is considered comfort food and is often served with a side of peas or a simple green salad, especially during colder months. Cultural variations: In Ireland, shepherd's pie may incorporate Irish stout into the meat mixture for deeper flavor; in Canada, 'Pâté chinois' is a common dish in Quebec, with corn as the middle layer."
         ]
     )]
     contexts: Vec<String>,
@@ -157,12 +157,12 @@ fn main() -> Result<()> {
     let result = model.process(
         &tokenizer,
         Either::Right(question),
-        Either::Left(vec![args.contexts]),
+        Either::Left(vec![args.contexts.clone()]),
         None,
         Some(args.threshold),
         Some(args.always_select_first),
         None,
-        Some(true),
+        None,
         None,
         None,
     )?;
@@ -173,7 +173,19 @@ fn main() -> Result<()> {
     dbg!(&question);
     dbg!(&result);
 
-    println!("Time elapsed: {:?}", duration);
+    for inner_pruned_contexts in result.pruned_context.iter() {
+        for (pruned_context_index, pruned_context) in inner_pruned_contexts.iter().enumerate() {
+            let original_context = args
+                .contexts
+                .get(pruned_context_index)
+                .context("Couldn't get original context")?;
+
+            let diff = get_inline_diff(original_context, pruned_context)?;
+            println!("\n{}", diff);
+        }
+    }
+
+    println!("\nTime elapsed: {:?}", duration);
 
     Ok(())
 }
@@ -215,6 +227,24 @@ fn get_model_files(
     }
 
     Ok((config, tokenizer, weights))
+}
+
+fn get_inline_diff(old: &str, new: &str) -> Result<String> {
+    let mut output = String::new();
+
+    let diff = TextDiff::from_words(old, new);
+
+    for change in diff.iter_all_changes() {
+        let (change_value, change_style) = match change.tag() {
+            ChangeTag::Delete => (change.value(), Style::new().red().strikethrough()),
+            ChangeTag::Insert => (change.value(), Style::new().green().bold()),
+            ChangeTag::Equal => (change.value(), Style::new().dim()),
+        };
+
+        write!(output, "{}", change_style.apply_to(change_value))?;
+    }
+
+    Ok(output)
 }
 
 // From xml-roberta
