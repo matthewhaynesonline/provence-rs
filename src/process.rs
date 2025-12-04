@@ -2,7 +2,7 @@ use candle_core::{Context, Error, IndexOp, Result, Tensor, bail};
 use either::Either;
 use tokenizers::{Encoding, Tokenizer};
 
-use super::{
+use crate::{
     ProvenceModel, ProvenceOutput,
     sentence_rounding::{
         SentenceRoundingMode, sentence_rounding, split_sentences_and_track_from_encoding,
@@ -57,11 +57,15 @@ impl ProvenceModel {
     ) -> Result<ProcessedResults> {
         let (questions, contexts, titles) = Self::prepare_process_params(question, context, title)?;
 
+        let mut pruned_context = Vec::with_capacity(questions.len());
+        let mut reranking_score = Vec::with_capacity(questions.len());
+        let mut compression_rate = Vec::with_capacity(questions.len());
+
         if questions.is_empty() {
             return Ok(ProcessedResults {
-                pruned_context: Vec::new(),
-                reranking_score: Vec::new(),
-                compression_rate: Vec::new(),
+                pruned_context,
+                reranking_score,
+                compression_rate,
             });
         }
 
@@ -74,10 +78,6 @@ impl ProvenceModel {
         // TODO implement
         let _batch_size = batch_size.unwrap_or(32);
         let _enable_warnings = enable_warnings.unwrap_or(true);
-
-        let mut pruned_context = Vec::with_capacity(questions.len());
-        let mut reranking_score = Vec::with_capacity(questions.len());
-        let mut compression_rate = Vec::with_capacity(questions.len());
 
         for (question_i, question) in questions.iter().enumerate() {
             let question_contexts = contexts.get(question_i).context(format!(
@@ -118,7 +118,6 @@ impl ProvenceModel {
                     None => context.to_owned(),
                 };
 
-                // TODO: tokenizer questions / sep / context separately, cache, then combine for forward?
                 let result = self.process_question_context(
                     tokenizer,
                     &normalized_question,
