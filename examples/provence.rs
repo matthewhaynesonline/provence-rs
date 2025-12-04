@@ -1,33 +1,16 @@
-use std::{fmt, path::PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Error as E, Result, bail};
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::debertav2::Config as DebertaV2Config;
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use either::Either;
 use hf_hub::{Repo, RepoType, api::sync::Api};
 use tokenizers::{Encoding, PaddingParams, Tokenizer};
 
 use candle_shims::utils::device::get_device;
 use provence_rs::ProvenceModel;
-
-enum TaskType {
-    Single(Box<ProvenceModel>),
-}
-
-#[derive(Parser, Debug, Clone, ValueEnum)]
-enum ArgsTask {
-    Single,
-}
-
-impl fmt::Display for ArgsTask {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::Single => write!(f, "single"),
-        }
-    }
-}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -87,17 +70,10 @@ struct Args {
     /// Always select first sentence
     #[arg(long, default_value_t = true)]
     always_select_first: bool,
-
-    /// Which task to run
-    #[arg(long, default_value_t = ArgsTask::Single)]
-    task: ArgsTask,
-    // /// Include token details
-    // #[arg(long)]
-    // detailed_output: bool,
 }
 
 impl Args {
-    fn build_model_and_tokenizer(&self) -> Result<(TaskType, DebertaV2Config, Tokenizer)> {
+    fn build_model_and_tokenizer(&self) -> Result<(ProvenceModel, DebertaV2Config, Tokenizer)> {
         let device = get_device(self.cpu, false)?;
 
         // Get files from either the HuggingFace API, or from a specified local directory.
@@ -129,13 +105,11 @@ impl Args {
 
         let vb = vb.set_prefix("deberta");
 
-        match self.task {
-            ArgsTask::Single => Ok((
-                TaskType::Single(ProvenceModel::load(vb, &config, Some(id2label.clone()))?.into()),
-                config,
-                tokenizer,
-            )),
-        }
+        Ok((
+            ProvenceModel::load(vb, &config, Some(id2label.clone()))?,
+            config,
+            tokenizer,
+        ))
     }
 }
 
@@ -143,7 +117,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     let model_load_time = std::time::Instant::now();
-    let (task_type, _model_config, tokenizer) = args.build_model_and_tokenizer()?;
+    let (model, _model_config, tokenizer) = args.build_model_and_tokenizer()?;
 
     println!(
         "Loaded model and tokenizers in {:?}",
@@ -157,54 +131,49 @@ fn main() -> Result<()> {
         tokenize_time.elapsed()
     );
 
-    match task_type {
-        TaskType::Single(model) => {
-            let question = &args.question;
-            let first_context = args.contexts.first().context("context can't be empty")?;
+    let question = &args.question;
+    let first_context = args.contexts.first().context("context can't be empty")?;
 
-            println!("Running forward pass only on question and first context");
+    println!("Running forward pass only on question and first context");
 
-            let input_text = ProvenceModel::format_input(question, first_context);
+    let input_text = ProvenceModel::apply_template(question, first_context);
 
-            let encoding = tokenizer
-                .encode(input_text, true)
-                .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
+    let encoding = tokenizer
+        .encode(input_text, true)
+        .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
 
-            let input_ids = Tensor::new(encoding.get_ids(), &model.device)?.unsqueeze(0)?;
-            let attention_mask =
-                Tensor::new(encoding.get_attention_mask(), &model.device)?.unsqueeze(0)?;
+    let input_ids = Tensor::new(encoding.get_ids(), &model.device)?.unsqueeze(0)?;
+    let attention_mask = Tensor::new(encoding.get_attention_mask(), &model.device)?.unsqueeze(0)?;
 
-            let output = model.forward(&input_ids, Some(attention_mask.clone()))?;
+    let output = model.forward(&input_ids, Some(attention_mask.clone()))?;
 
-            println!("Forward pass output");
-            dbg!(&output);
+    println!("Forward pass output");
+    dbg!(&output);
 
-            println!("Running process helper function");
+    println!("Running process helper function");
 
-            let start = std::time::Instant::now();
+    let start = std::time::Instant::now();
 
-            let result = model.process(
-                &tokenizer,
-                Either::Right(question),
-                Either::Left(vec![args.contexts]),
-                None,
-                Some(args.threshold),
-                Some(args.always_select_first),
-                None,
-                Some(true),
-                None,
-                None,
-            )?;
+    let result = model.process(
+        &tokenizer,
+        Either::Right(question),
+        Either::Left(vec![args.contexts]),
+        None,
+        Some(args.threshold),
+        Some(args.always_select_first),
+        None,
+        Some(true),
+        None,
+        None,
+    )?;
 
-            let duration = start.elapsed();
+    let duration = start.elapsed();
 
-            println!("Simple output");
-            dbg!(&question);
-            dbg!(&result);
+    println!("Simple output");
+    dbg!(&question);
+    dbg!(&result);
 
-            println!("Time elapsed: {:?}", duration);
-        }
-    }
+    println!("Time elapsed: {:?}", duration);
 
     Ok(())
 }

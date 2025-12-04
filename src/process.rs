@@ -2,10 +2,7 @@ use candle_core::{Context, Error, IndexOp, Result, Tensor, bail};
 use either::Either;
 use tokenizers::{Encoding, Tokenizer};
 
-use crate::{
-    ProvenceModel, ProvenceOutput,
-    sentence_rounding::{sentence_rounding, split_sentences_and_track_from_encoding},
-};
+use crate::{ProvenceModel, ProvenceOutput, sentence_rounding::split_and_round_sentences};
 
 pub type MultipleQuestions = Vec<String>;
 pub type MultipleContexts = Vec<Vec<String>>;
@@ -37,6 +34,7 @@ pub mod config {
     // TODO: use tokens not chars
     pub const CHARS_PER_TOKEN: usize = 4;
     pub const MAX_LEN_CHARS: usize = MAX_LEN * CHARS_PER_TOKEN;
+    pub const MAX_LEN_CHARS_PART: usize = (MAX_LEN_CHARS) / 2;
 }
 
 impl ProvenceModel {
@@ -180,7 +178,6 @@ impl ProvenceModel {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn process_question_context(
         &self,
         tokenizer: &Tokenizer,
@@ -190,11 +187,11 @@ impl ProvenceModel {
         threshold: f32,
         always_select_first: bool,
     ) -> Result<ProcessedResult> {
-        let input_text = Self::format_input(question, context);
+        let mut input_text = Self::apply_template(question, context);
+        Self::truncate_warn(&mut input_text, "Process input", config::MAX_LEN_CHARS);
 
         let (encoding, input_ids, attention_mask) = self.encode_input(tokenizer, &input_text)?;
         let tokens = encoding.get_ids();
-
         let separator_index =
             Self::get_separator_index(&encoding).context("separator token missing")?;
 
@@ -206,22 +203,18 @@ impl ProvenceModel {
             .copied()
             .context("ranking_scores was empty")?;
 
-        let (_sentence_texts, sentences_token_coords) = split_sentences_and_track_from_encoding(
+        let keep_probs = Self::get_keep_probabilities(&output)?;
+        let keep_mask = split_and_round_sentences(
             context,
             encoding.get_offsets(),
             context_start_offset,
-        )?;
-
-        let keep_probs = Self::get_keep_probabilities(&output)?;
-        let keep_mask = sentence_rounding(
             &keep_probs,
-            &sentences_token_coords,
             threshold,
             always_select_first,
         )?;
 
         let (kept_token_ids, _removed_token_ids) =
-            Self::group_context_tokens(tokens, separator_index, &keep_mask);
+            Self::apply_keep_mask_after_skip(tokens, separator_index, &keep_mask);
 
         let pruned_context = tokenizer
             .decode(&kept_token_ids, true)
@@ -238,7 +231,7 @@ impl ProvenceModel {
         })
     }
 
-    pub fn encode_input(&self, tokenizer: &Tokenizer, input_text: &str) -> Result<EncodedInput> {
+    fn encode_input(&self, tokenizer: &Tokenizer, input_text: &str) -> Result<EncodedInput> {
         let encoding = tokenizer
             .encode(input_text, true)
             .map_err(|e| Error::msg(format!("Tokenization failed: {}", e)))?;
@@ -251,11 +244,11 @@ impl ProvenceModel {
         Ok((encoding, input_ids, attention_mask))
     }
 
-    pub fn format_input(question: &str, context: &str) -> String {
+    pub fn apply_template(question: &str, context: &str) -> String {
         format!("{} {} {}", question, config::SEPARATOR_TOKEN, context)
     }
 
-    pub fn prepare_process_params(
+    fn prepare_process_params(
         question: Either<MultipleQuestions, &str>,
         context: Either<MultipleContexts, &str>,
         title: Option<Either<MultipleTitles, &str>>,
@@ -290,23 +283,42 @@ impl ProvenceModel {
                 bail!("Question '{}' cannot be empty", question_i)
             }
 
-            Self::truncate_warn(question, &format!("Question {}", question_i));
+            Self::truncate_warn(
+                question,
+                &format!("Question {}", question_i),
+                config::MAX_LEN_CHARS_PART,
+            );
         }
 
         match titles {
             Some(ref mut titles) => {
+                if titles.len() != questions.len() {
+                    bail!("'titles' must be a list of strings of the same length as 'questions'")
+                }
+
                 for (inner_contexts_index, (inner_contexts, inner_titles)) in
                     contexts.iter_mut().zip(titles.iter_mut()).enumerate()
                 {
                     let mut new_inner_contexts = Vec::with_capacity(inner_contexts.len());
                     let mut new_inner_titles = Vec::with_capacity(inner_titles.len());
 
-                    if inner_contexts.len() != inner_titles.len() {
+                    let inner_titles_len = inner_titles.len();
+                    let inner_contexts_len = inner_contexts.len();
+
+                    if inner_titles_len != inner_contexts_len {
                         bail!(
-                            "Context list {} has length {} but title list has length {}",
+                            "Each list in 'titles' must have the same length as the corresponding list in 'context': context list {} has length {} but title list has length {}",
                             inner_contexts_index,
-                            inner_contexts.len(),
-                            inner_titles.len()
+                            inner_titles_len,
+                            inner_contexts_len
+                        );
+                    }
+
+                    for (title_i, title) in inner_titles.iter_mut().enumerate() {
+                        Self::truncate_warn(
+                            title,
+                            &format!("Title {}", title_i),
+                            config::MAX_LEN_CHARS_PART,
                         );
                     }
 
@@ -318,8 +330,10 @@ impl ProvenceModel {
                         let split_result = Self::split_warn(
                             &mut context,
                             &format!("Context [{}][{}]", inner_contexts_index, context_index),
+                            config::MAX_LEN_CHARS_PART,
                         );
 
+                        // Need to dupe titles to match the new split contexts
                         new_inner_contexts.push(context);
                         new_inner_titles.push(title.clone());
 
@@ -343,6 +357,7 @@ impl ProvenceModel {
                         let split_result = Self::split_warn(
                             &mut context_str,
                             &format!("Context [{}][{}]", inner_contexts_index, context_index),
+                            config::MAX_LEN_CHARS_PART,
                         );
 
                         new_inner_contexts.push(context_str);
@@ -351,28 +366,8 @@ impl ProvenceModel {
                             new_inner_contexts.extend(splits);
                         }
                     }
+
                     *inner_contexts = new_inner_contexts;
-                }
-            }
-        }
-
-        if let Some(ref mut titles) = titles {
-            if titles.len() != questions.len() {
-                bail!("'titles' must be a list of strings of the same length as 'questions'")
-            }
-
-            for (inner_titles, inner_contexts) in titles.iter_mut().zip(contexts.iter()) {
-                let inner_titles_len = inner_titles.len();
-                let inner_contexts_len = inner_contexts.len();
-
-                if inner_titles_len != inner_contexts_len {
-                    bail!(
-                        "Each list in 'titles' must have the same length as the corresponding list in 'context'"
-                    )
-                }
-
-                for (title_i, title) in inner_titles.iter_mut().enumerate() {
-                    Self::truncate_warn(title, &format!("Title {}", title_i));
                 }
             }
         }
@@ -380,29 +375,28 @@ impl ProvenceModel {
         Ok((questions, contexts, titles))
     }
 
-    fn split_warn(text: &mut String, label: &str) -> Option<Vec<String>> {
-        let split_byte_index = text
-            .char_indices()
-            .nth(config::MAX_LEN_CHARS)
-            .map(|(index, _)| index);
+    fn split_warn(text: &mut String, label: &str, max_len: usize) -> Option<Vec<String>> {
+        let split_byte_index = text.char_indices().nth(max_len).map(|(index, _)| index);
 
         match split_byte_index {
             None => None,
             Some(split_index) => {
-                let preview: String = text.chars().take(20).collect();
+                let preview_num_chars = 20;
+                let preview: String = text.chars().take(preview_num_chars).collect();
+
                 eprintln!(
                     "WARNING: {} '{}...' (len {}) exceeded max len {}. Splitting.",
                     label,
                     preview,
                     text.chars().count(),
-                    config::MAX_LEN_CHARS
+                    max_len
                 );
 
                 let mut remainder = text.split_off(split_index);
                 let mut chunks = Vec::new();
 
                 loop {
-                    match remainder.char_indices().nth(config::MAX_LEN_CHARS) {
+                    match remainder.char_indices().nth(max_len) {
                         Some((next_split_index, _)) => {
                             let tail = remainder.split_off(next_split_index);
                             chunks.push(remainder);
@@ -420,16 +414,17 @@ impl ProvenceModel {
         }
     }
 
-    fn truncate_warn(text: &mut String, label: &str) {
-        if let Some((byte_index, _)) = text.char_indices().nth(config::MAX_LEN_CHARS) {
-            let preview: String = text.chars().take(20).collect();
+    fn truncate_warn(text: &mut String, label: &str, max_len: usize) {
+        if let Some((byte_index, _)) = text.char_indices().nth(max_len) {
+            let preview_num_chars = 20;
+            let preview: String = text.chars().take(preview_num_chars).collect();
 
             eprintln!(
                 "WARNING: {} '{}...' (len {}) exceeded max len {}. Truncating.",
                 label,
                 preview,
                 text.chars().count(),
-                config::MAX_LEN_CHARS
+                max_len
             );
 
             text.truncate(byte_index);
@@ -449,14 +444,14 @@ impl ProvenceModel {
             .join(" ")
     }
 
-    pub fn get_separator_index(encoding: &Encoding) -> Option<usize> {
+    fn get_separator_index(encoding: &Encoding) -> Option<usize> {
         encoding
             .get_tokens()
             .iter()
             .position(|t| t == config::SEPARATOR_TOKEN)
     }
 
-    pub fn get_keep_probabilities(output: &ProvenceOutput) -> Result<Vec<f32>> {
+    fn get_keep_probabilities(output: &ProvenceOutput) -> Result<Vec<f32>> {
         let compression_logits = output.compression_logits.squeeze(0)?;
         let compression_probs = candle_nn::ops::softmax(&compression_logits, 1)?;
 
@@ -466,16 +461,16 @@ impl ProvenceModel {
         Ok(keep_probs_vec)
     }
 
-    pub fn group_context_tokens(
+    fn apply_keep_mask_after_skip(
         tokens: &[u32],
-        separator_index: usize,
+        skip: usize,
         keep_mask: &[bool],
     ) -> (Vec<u32>, Vec<u32>) {
         let mut kept_token_ids = Vec::new();
         let mut removed_token_ids = Vec::new();
 
-        for (i, &token_id) in tokens.iter().enumerate().skip(separator_index + 1) {
-            if keep_mask.get(i).copied().unwrap_or(false) {
+        for (i, &token_id) in tokens.iter().enumerate().skip(skip + 1) {
+            if keep_mask.get(i) == Some(&true) {
                 kept_token_ids.push(token_id);
             } else {
                 removed_token_ids.push(token_id);
@@ -485,7 +480,7 @@ impl ProvenceModel {
         (kept_token_ids, removed_token_ids)
     }
 
-    pub fn calculate_compression_rate(context: &str, pruned_context: &str) -> f32 {
+    fn calculate_compression_rate(context: &str, pruned_context: &str) -> f32 {
         let context_len = context.chars().count() as f32;
 
         if context_len > 0.0 {

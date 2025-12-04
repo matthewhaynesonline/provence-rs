@@ -5,28 +5,49 @@ pub type SplitAndTrimResult = Result<(Vec<String>, Vec<Offsets>)>;
 pub type TrimRangeResult = Result<Option<(String, Offsets)>>;
 
 pub mod config {
+    pub const DROP_VALUE: f32 = 0.0;
+    pub const KEEP_VALUE: f32 = 1.0;
     pub const SENTENCE_ENDING: &[char] = &['.', '!', '?'];
+}
+
+pub fn split_and_round_sentences(
+    context: &str,
+    encoding_offsets: &[Offsets],
+    context_start_offset: usize,
+    token_predictions: &[f32],
+    threshold: f32,
+    always_select_first: bool,
+) -> Result<Vec<bool>> {
+    let (_sentence_texts, sentences_to_tokens_ranges) =
+        split_sentences_and_track_from_encoding(context, encoding_offsets, context_start_offset)?;
+
+    sentence_rounding(
+        token_predictions,
+        &sentences_to_tokens_ranges,
+        threshold,
+        always_select_first,
+    )
 }
 
 /// Apply sentence-level rounding to token predictions.
 ///
-/// A sentence is kept if the mean probability of its tokens exceeds `threshold`
+/// A sentence is kept if the mean decision of its tokens exceeds `threshold`
 /// If always_select_first is true, the first sentence is kept (only when
 /// another sentence would be kept).
 pub fn sentence_rounding(
     token_predictions: &[f32],
-    sentences_token_coords: &[Offsets],
+    sentences_to_tokens_ranges: &[Offsets],
     threshold: f32,
     always_select_first: bool,
 ) -> Result<Vec<bool>> {
-    if sentences_token_coords.is_empty() {
-        bail!("sentences_token_coords is empty");
+    if sentences_to_tokens_ranges.is_empty() {
+        bail!("sentences_to_tokens_ranges is empty");
     }
 
     let n_tokens = token_predictions.len();
-    let mut sentence_means: Vec<f32> = Vec::with_capacity(sentences_token_coords.len());
+    let mut sentence_means: Vec<f32> = Vec::with_capacity(sentences_to_tokens_ranges.len());
 
-    for coord in sentences_token_coords {
+    for coord in sentences_to_tokens_ranges {
         if coord.0 >= coord.1 {
             bail!("invalid Offsets: start ({}) >= end ({})", coord.0, coord.1);
         }
@@ -39,7 +60,7 @@ pub fn sentence_rounding(
             );
         }
 
-        let token_coords = &token_predictions.get(coord.0..coord.1).context(format!(
+        let token_coords = token_predictions.get(coord.0..coord.1).context(format!(
             "Couldn't get token_coords {}..{}",
             coord.0, coord.1
         ))?;
@@ -47,15 +68,14 @@ pub fn sentence_rounding(
         let (tokens_sum, tokens_count) =
             token_coords
                 .iter()
-                .copied()
-                .fold((0.0, 0), |(sum, count), token_keep_prob| {
+                .fold((config::DROP_VALUE, 0), |(sum, count), token_keep_prob| {
                     if token_keep_prob.is_nan() {
                         (sum, count)
                     } else {
-                        let token_decision = if token_keep_prob > threshold {
-                            1.0
+                        let token_decision = if token_keep_prob > &threshold {
+                            config::KEEP_VALUE
                         } else {
-                            0.0
+                            config::DROP_VALUE
                         };
 
                         (sum + token_decision, count + 1)
@@ -63,7 +83,7 @@ pub fn sentence_rounding(
                 });
 
         let mean = if tokens_count == 0 {
-            0.0
+            config::DROP_VALUE
         } else {
             tokens_sum / (tokens_count as f32)
         };
@@ -75,25 +95,25 @@ pub fn sentence_rounding(
         && sentence_means.iter().skip(1).any(|&m| m > threshold)
         && let Some(first) = sentence_means.get_mut(0)
     {
-        *first = 1.0;
+        *first = config::KEEP_VALUE;
     }
 
     let mut keep_mask = vec![false; n_tokens];
 
-    for (coord, &mean) in sentences_token_coords.iter().zip(sentence_means.iter()) {
+    for (coord, &mean) in sentences_to_tokens_ranges.iter().zip(sentence_means.iter()) {
         if mean <= threshold {
             continue;
         }
 
-        if let Some(slice) = keep_mask.get_mut(coord.0..coord.1) {
-            slice.fill(true);
+        if let Some(mask_slice) = keep_mask.get_mut(coord.0..coord.1) {
+            mask_slice.fill(true);
         }
     }
 
     Ok(keep_mask)
 }
 
-/// Split context into sentences (simple splitter) but return token index coords
+/// Split context into sentences but return token index coords
 /// relative to the full encoding token indices by using encoding offsets.
 pub fn split_sentences_and_track_from_encoding(
     context: &str,
@@ -101,13 +121,13 @@ pub fn split_sentences_and_track_from_encoding(
     context_start_offset: usize,
 ) -> Result<(Vec<String>, Vec<Offsets>)> {
     let (sentences, sentence_ranges_rel_to_context) = split_and_trim_sentences(context)?;
-    let sentences_token_coords = map_ranges_to_token_coords(
-        encoding_offsets,
+    let sentences_to_tokens_ranges = map_sentence_ranges_to_token_ranges(
         &sentence_ranges_rel_to_context,
         context_start_offset,
+        encoding_offsets,
     )?;
 
-    Ok((sentences, sentences_token_coords))
+    Ok((sentences, sentences_to_tokens_ranges))
 }
 
 /// Split `context` into trimmed sentences and return
@@ -121,10 +141,10 @@ fn split_and_trim_sentences(context: &str) -> SplitAndTrimResult {
         // TODO: cache?
         // TODO: custom train?
         // TODO: use tokenizers?
-        let data = punkt::TrainingData::english();
+        let punkt_data = punkt::TrainingData::english();
 
         for (start, end) in
-            punkt::SentenceByteOffsetTokenizer::<punkt::params::Standard>::new(context, &data)
+            punkt::SentenceByteOffsetTokenizer::<punkt::params::Standard>::new(context, &punkt_data)
         {
             if let Some((sentence, (trim_start, trim_end))) = trim_range(context, start, end)?
                 && !sentence.is_empty()
@@ -230,16 +250,28 @@ fn trim_range(context: &str, start: usize, end: usize) -> TrimRangeResult {
     )))
 }
 
-/// Map trimmed byte ranges (relative to `context`) into token Offsets ranges using `offsets`.
-/// offsets: slice of (token_byte_start, token_byte_end) for the full input.
-fn map_ranges_to_token_coords(
-    offsets: &[Offsets],
+/// Maps byte ranges of sentences (relative to `context`) to their corresponding
+/// token index ranges.
+///
+/// Returns a list of (start_token_index, end_token_index), where the end index is exclusive.
+///
+/// ### Example
+/// Text:          Hello dog.                     Hello cat.
+/// Sentences:   [[0,                   9],      [10,                      20]]
+/// Tokens:     0:[0,5], 1:[6,9], 2:[9,10],    3:[10,15], 4:[16,19], 5:[19,20]
+///                "Hello"  "dog"    "."          "Hello"    "cat"      "."
+/// Output:      [[0,                   3],      [3,                        6]]
+///
+/// Sentence 1 (0-9) overlaps tokens 0, 1, 2. Range is 0..3
+/// Sentence 2 (10-20) overlaps tokens 3, 4, 5. Range is 3..6
+fn map_sentence_ranges_to_token_ranges(
     sentence_ranges_rel_to_context: &[Offsets],
     context_start_offset: usize,
+    token_offsets: &[Offsets],
 ) -> Result<Vec<Offsets>> {
-    let mut sentences_token_coords = Vec::with_capacity(sentence_ranges_rel_to_context.len());
+    let mut sentences_to_tokens_ranges = Vec::with_capacity(sentence_ranges_rel_to_context.len());
     let mut token_index_sentence_start = 0;
-    let n_tokens = offsets.len();
+    let n_tokens = token_offsets.len();
 
     for &(sentence_start, sentence_end) in sentence_ranges_rel_to_context {
         let sentence_start_abs = context_start_offset + sentence_start;
@@ -247,11 +279,14 @@ fn map_ranges_to_token_coords(
 
         // Fast forward past tokens that are entirely before the current sentence
         while token_index_sentence_start < n_tokens {
-            let &(token_start, token_end) = offsets
-                .get(token_index_sentence_start)
-                .context(format!("Couldn't get offsets {token_index_sentence_start}"))?;
+            let &(token_start, token_end) =
+                token_offsets
+                    .get(token_index_sentence_start)
+                    .context(format!(
+                        "Couldn't get token_offsets {token_index_sentence_start}"
+                    ))?;
 
-            // skip tokens with no offsets (common for special tokens)
+            // skip tokens with no token_offsets (common for special tokens)
             if token_start == 0 && token_end == 0 {
                 token_index_sentence_start += 1;
                 continue;
@@ -271,11 +306,11 @@ fn map_ranges_to_token_coords(
 
         // Scans the tokens that overlap with the sentence and stop as soon as it goes past the sentence
         while token_index_in_sentence < n_tokens {
-            let &(token_start, token_end) = offsets
-                .get(token_index_in_sentence)
-                .context(format!("Couldn't get offsets {token_index_in_sentence}"))?;
+            let &(token_start, token_end) = token_offsets.get(token_index_in_sentence).context(
+                format!("Couldn't get token_offsets {token_index_in_sentence}"),
+            )?;
 
-            // skip tokens with no offsets (common for special tokens)
+            // skip tokens with no token_offsets (common for special tokens)
             if token_start == 0 && token_end == 0 {
                 token_index_in_sentence += 1;
                 continue;
@@ -303,14 +338,14 @@ fn map_ranges_to_token_coords(
         token_index_sentence_start = token_index_in_sentence;
 
         if let (Some(first), Some(last)) = (first_token_index, last_token_index) {
-            sentences_token_coords.push((
+            sentences_to_tokens_ranges.push((
                 first,
                 last + 1, // end exclusive
             ));
         }
     }
 
-    Ok(sentences_token_coords)
+    Ok(sentences_to_tokens_ranges)
 }
 
 // A and B overlap if
